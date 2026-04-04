@@ -8,6 +8,7 @@
 #define ENGINE_H
 
 #include "gguf.h"
+#include "tokenizer.h"
 #include "vulkan_compute.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -80,6 +81,7 @@ typedef struct {
     scratch_buffers scratch;
     
     /* Tokenizer (BPE) */
+    tokenizer   tok;
     char**          vocab;
     float*          vocab_scores;
     uint32_t        vocab_size;

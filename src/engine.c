@@ -114,11 +114,13 @@ bool engine_load_model(engine* eng, const char* model_path) {
     }
     
     /* Load tokenizer vocabulary */
+    if (!tokenizer_load(&eng->tok, eng->gguf)) {
+        fprintf(stderr, "engine: warning — tokenizer failed to load, using byte-level fallback\n");
+    }
+    
     const gguf_kv* tokens_kv = gguf_find_kv(eng->gguf, "tokenizer.ggml.tokens");
     if (tokens_kv && tokens_kv->type == GGUF_TYPE_ARRAY) {
         eng->vocab_size = (uint32_t)tokens_kv->value.arr.count;
-        /* Token strings are in the GGUF mmap — we'll access them lazily */
-        /* For MVP, we use token IDs directly */
         printf("engine: vocabulary size: %u tokens\n", eng->vocab_size);
     } else {
         eng->vocab_size = eng->arch.vocab_size;
@@ -413,33 +415,29 @@ uint32_t engine_generate(engine* eng, const uint32_t* prompt, uint32_t prompt_le
 
 /* ───── Tokenization (BPE) ───── */
 
-/* MVP tokenizer: byte-level encoding. 
- * Full BPE requires loading merge rules from GGUF — TODO */
 uint32_t* engine_tokenize(const engine* eng, const char* text, uint32_t* n_tokens) {
-    /* For MVP: simple byte-level tokenization 
-     * Real tokenizer needs BPE merge table from tokenizer.ggml.merges */
+    if (eng->tok.loaded) {
+        return tokenizer_encode(&eng->tok, text, n_tokens, true);
+    }
+    
+    /* Fallback: simple byte-level tokenization */
     size_t len = strlen(text);
     uint32_t* tokens = malloc((len + 2) * sizeof(uint32_t));
-    
-    /* Add BOS token */
     tokens[0] = eng->arch.bos_token_id;
     uint32_t count = 1;
-    
-    /* Simple: each byte maps to its vocab index (works for byte-level BPE models) */
     for (size_t i = 0; i < len; i++) {
         tokens[count++] = (uint32_t)(unsigned char)text[i];
     }
-    
     *n_tokens = count;
     return tokens;
 }
 
 const char* engine_detokenize(const engine* eng, uint32_t token_id) {
-    /* MVP: return "?" for unknown tokens */
-    /* Real implementation reads from tokenizer.ggml.tokens array in GGUF */
-    (void)eng;
-    (void)token_id;
+    if (eng->tok.loaded) {
+        return tokenizer_decode(&eng->tok, token_id);
+    }
     
+    /* Fallback */
     static char buf[8];
     if (token_id < 128 && token_id >= 32) {
         buf[0] = (char)token_id;
@@ -519,6 +517,9 @@ void engine_destroy(engine* eng) {
     if (eng->weights.output.buffer != eng->weights.token_embd.buffer) {
         vk_free_buffer(&eng->vk, &eng->weights.output);
     }
+    
+    /* Free tokenizer */
+    tokenizer_free(&eng->tok);
     
     /* Free GGUF */
     gguf_free(eng->gguf);
