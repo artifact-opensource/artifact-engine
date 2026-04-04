@@ -12,6 +12,7 @@
 #include "../include/gguf.h"
 #include "../include/engine.h"
 #include "../include/http_server.h"
+#include "../include/model_fetch.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,7 @@ static void print_usage(const char* argv0) {
     printf("  --host <host>     HTTP server host (default: 0.0.0.0)\n");
     printf("  --ctx <length>    Max context length (default: 4096)\n");
     printf("  --shaders <dir>   Path to compiled shader directory (default: ./shaders)\n");
+    printf("  --pull <url>      Download model from HTTP URL before starting\n");
     printf("  --info            Print model info and exit\n");
     printf("  --bench           Run inference benchmark\n");
     printf("  --help            Show this help\n");
@@ -60,6 +62,7 @@ static void print_usage(const char* argv0) {
 
 int main(int argc, char** argv) {
     const char* model_path = NULL;
+    const char* pull_url = NULL;
     const char* shader_dir = "./shaders";
     const char* host = "0.0.0.0";
     uint16_t port = 8080;
@@ -79,6 +82,8 @@ int main(int argc, char** argv) {
             ctx_len = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--shaders") == 0 && i + 1 < argc) {
             shader_dir = argv[++i];
+        } else if (strcmp(argv[i], "--pull") == 0 && i + 1 < argc) {
+            pull_url = argv[++i];
         } else if (strcmp(argv[i], "--info") == 0) {
             mode_info = 1;
         } else if (strcmp(argv[i], "--bench") == 0) {
@@ -93,8 +98,45 @@ int main(int argc, char** argv) {
         }
     }
     
+    /* ─── Pull model from URL if requested ─── */
+    if (pull_url && !model_path) {
+        const char* fname = model_fetch_filename(pull_url);
+        static char pull_path[512];
+#ifdef _WIN32
+        const char* appdata = getenv("LOCALAPPDATA");
+        if (appdata) {
+            snprintf(pull_path, sizeof(pull_path), "%s\\..\\LocalState\\%s", appdata, fname);
+        } else {
+            snprintf(pull_path, sizeof(pull_path), "models\\%s", fname);
+        }
+#else
+        snprintf(pull_path, sizeof(pull_path), "models/%s", fname);
+#endif
+        /* Check if already downloaded */
+        FILE* check = fopen(pull_path, "rb");
+        if (check) {
+            fseek(check, 0, SEEK_END);
+            long fsize = ftell(check);
+            fclose(check);
+            if (fsize > 1024*1024) {
+                printf("Model already exists: %s (%.2f GB)\n", pull_path, 
+                       fsize / (1024.0*1024*1024));
+                model_path = pull_path;
+            }
+        }
+        
+        if (!model_path) {
+            printf("\nDownloading model from %s...\n\n", pull_url);
+            if (model_fetch(pull_url, pull_path)) {
+                model_path = pull_path;
+            } else {
+                fprintf(stderr, "Failed to download model\n");
+                return 1;
+            }
+        }
+    }
+    
     if (!model_path) {
-        /* Auto-detect: scan for .gguf files in common locations */
         static char auto_path[512];
 #ifdef _WIN32
         /* Check LocalState (UWP app data) */
@@ -180,9 +222,34 @@ int main(int argc, char** argv) {
         }
 #endif
         if (!model_path) {
-            fprintf(stderr, "Error: --model is required (or place a .gguf file in current dir)\n\n");
-            print_usage(argv[0]);
-            return 1;
+            /* No model found locally — try auto-pull from LAN */
+            const char* lan_url = pull_url ? pull_url : 
+                "http://192.168.1.8:9090/Qwen3.5-9B-Q4_K_M.gguf";
+            const char* fname = model_fetch_filename(lan_url);
+            static char fetch_path[512];
+#ifdef _WIN32
+            const char* ad = getenv("LOCALAPPDATA");
+            if (ad) {
+                /* UWP LocalState — writable by the app */
+                snprintf(fetch_path, sizeof(fetch_path), "%s\\..\\LocalState\\%s", ad, fname);
+            } else {
+                snprintf(fetch_path, sizeof(fetch_path), "models\\%s", fname);
+            }
+#else
+            snprintf(fetch_path, sizeof(fetch_path), "models/%s", fname);
+#endif
+            printf("\nNo local model found. Fetching from LAN...\n");
+            printf("URL: %s\n", lan_url);
+            printf("Destination: %s\n\n", fetch_path);
+            
+            if (model_fetch(lan_url, fetch_path)) {
+                model_path = fetch_path;
+            } else {
+                fprintf(stderr, "\nError: No model available.\n");
+                fprintf(stderr, "Provide --model <path.gguf> or --pull <url>\n");
+                fprintf(stderr, "Or start HTTP server on Victus: python3 -m http.server 9090\n\n");
+                return 1;
+            }
         }
         printf("Auto-detected model: %s\n", model_path);
     }

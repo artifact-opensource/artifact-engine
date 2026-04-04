@@ -21,7 +21,7 @@ echo.
 echo [1/2] Compiling...
 cl.exe /nologo /O2 /DCPU_ONLY /DWIN32 /D_CRT_SECURE_NO_WARNINGS ^
   /Fe:artifact-engine.exe ^
-  src\gguf.c src\tokenizer.c src\cpu_compute.c src\engine.c src\http_server.c src\main.c ^
+  src\gguf.c src\tokenizer.c src\cpu_compute.c src\engine.c src\http_server.c src\model_fetch.c src\main.c ^
   /I include ^
   /link ws2_32.lib advapi32.lib
 
