@@ -103,11 +103,24 @@ int main(int argc, char** argv) {
             ".",
             "models",
             "D:\\DevelopmentFiles",
-            "D:\\DevelopmentFiles\\WdpTempWebFolder",
             "D:\\DevelopmentFiles\\models",
+            "D:\\DevelopmentFiles\\WdpTempWebFolder",
             "C:\\Users\\ali\\models",
             NULL
         };
+        
+        /* Recursive scan helper: check dir and one level of subdirs */
+        #define SCAN_GGUF(dir) do { \
+            WIN32_FIND_DATAA _fd; \
+            char _search[512]; \
+            snprintf(_search, sizeof(_search), "%s\\*.gguf", dir); \
+            HANDLE _h = FindFirstFileA(_search, &_fd); \
+            if (_h != INVALID_HANDLE_VALUE) { \
+                snprintf(auto_path, sizeof(auto_path), "%s\\%s", dir, _fd.cFileName); \
+                model_path = auto_path; \
+                FindClose(_h); \
+            } \
+        } while(0)
         
         /* Try LocalState first (Xbox UWP) */
         if (local_appdata) {
@@ -126,16 +139,26 @@ int main(int argc, char** argv) {
         /* Then try each scan dir */
         if (!model_path) {
             for (int d = 0; scan_dirs[d] && !model_path; d++) {
-                WIN32_FIND_DATAA fd;
-                char search[512];
-                snprintf(search, sizeof(search), "%s\\*.gguf", scan_dirs[d]);
-                HANDLE h = FindFirstFileA(search, &fd);
-                if (h != INVALID_HANDLE_VALUE) {
-                    snprintf(auto_path, sizeof(auto_path), "%s\\%s", 
-                             scan_dirs[d], fd.cFileName);
-                    model_path = auto_path;
-                    FindClose(h);
-                }
+                SCAN_GGUF(scan_dirs[d]);
+            }
+        }
+        
+        /* Deep scan WdpTempWebFolder subdirs (Device Portal uploads land here) */
+        if (!model_path) {
+            WIN32_FIND_DATAA subdir;
+            HANDLE hdir = FindFirstFileA("D:\\DevelopmentFiles\\WdpTempWebFolder\\*", &subdir);
+            if (hdir != INVALID_HANDLE_VALUE) {
+                do {
+                    if ((subdir.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && 
+                        subdir.cFileName[0] != '.') {
+                        char subpath[512];
+                        snprintf(subpath, sizeof(subpath), 
+                                 "D:\\DevelopmentFiles\\WdpTempWebFolder\\%s", subdir.cFileName);
+                        SCAN_GGUF(subpath);
+                        if (model_path) break;
+                    }
+                } while (FindNextFileA(hdir, &subdir));
+                FindClose(hdir);
             }
         }
 #else
