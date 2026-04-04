@@ -14,6 +14,10 @@
 #include <math.h>
 #include <time.h>
 
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
 /* ───── Engine Init ───── */
 
 bool engine_init(engine* eng, const char* shader_dir) {
@@ -377,8 +381,14 @@ uint32_t engine_generate(engine* eng, const uint32_t* prompt, uint32_t prompt_le
     uint32_t generated = 0;
     uint32_t token = 0;
     
+#ifdef _WIN32
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+#else
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
     
     for (uint32_t i = 0; i < params->max_tokens; i++) {
         /* Download logits from GPU */
@@ -403,8 +413,13 @@ uint32_t engine_generate(engine* eng, const uint32_t* prompt, uint32_t prompt_le
         engine_forward(eng, &token, 1);
     }
     
+#ifdef _WIN32
+    QueryPerformanceCounter(&end);
+    double elapsed = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
+#else
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+#endif
     
     printf("engine: generated %u tokens in %.2fs (%.1f tok/s)\n",
            generated, elapsed, generated / elapsed);

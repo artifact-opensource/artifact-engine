@@ -29,7 +29,11 @@ static void signal_handler(int sig) {
 }
 
 static void print_usage(const char* argv0) {
+#ifdef CPU_ONLY
+    printf("Artifact Engine v%s — CPU LLM Inference\n", VERSION);
+#else
     printf("Artifact Engine v%s — GPU LLM Inference via Vulkan\n", VERSION);
+#endif
     printf("Artifact Virtual — artifact.cloud\n\n");
     printf("Usage: %s --model <path.gguf> [options]\n\n", argv0);
     printf("Options:\n");
@@ -117,9 +121,13 @@ int main(int argc, char** argv) {
     
     engine eng = {0};
     
+#ifdef CPU_ONLY
+    printf("[1/4] Initializing CPU compute...\n");
+#else
     printf("[1/4] Initializing Vulkan...\n");
+#endif
     if (!engine_init(&eng, shader_dir)) {
-        fprintf(stderr, "Failed to initialize Vulkan compute\n");
+        fprintf(stderr, "Failed to initialize compute backend\n");
         return 1;
     }
     
