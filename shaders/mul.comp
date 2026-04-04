@@ -1,0 +1,23 @@
+/*
+ * Element-wise Multiplication — Artifact Engine
+ * Out = A * B (used for FFN gating: gate * up)
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA   { float A[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB   { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufOut  { float Out[]; };
+
+layout(push_constant) uniform Params {
+    uint M;  /* number of elements */
+    uint N; uint K; uint stride;
+    float scale; uint offset; uint head_dim; uint n_heads;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= M) return;
+    Out[idx] = A[idx] * B[idx];
+}

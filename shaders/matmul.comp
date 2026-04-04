@@ -1,0 +1,70 @@
+/*
+ * Matrix Multiplication — Artifact Engine
+ * C = A × B where A[M,K], B[K,N], C[M,N]
+ * 
+ * Tiled implementation for GPU cache efficiency.
+ * Each workgroup computes a TILE_M × TILE_N block of C.
+ */
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float C[]; };
+
+layout(push_constant) uniform Params {
+    uint M;     /* rows of A and C */
+    uint N;     /* cols of B and C */
+    uint K;     /* cols of A, rows of B */
+    uint stride;
+    float scale;
+    uint offset;
+    uint head_dim;
+    uint n_heads;
+};
+
+/* Shared memory tiles for coalesced access */
+shared float tileA[16][16];
+shared float tileB[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    
+    if (row >= M || col >= N) return;
+    
+    float sum = 0.0;
+    
+    /* Iterate over K in tiles of 16 */
+    uint n_tiles = (K + 15) / 16;
+    
+    for (uint t = 0; t < n_tiles; t++) {
+        /* Load tile of A into shared memory */
+        uint a_col = t * 16 + gl_LocalInvocationID.x;
+        if (row < M && a_col < K) {
+            tileA[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = A[row * K + a_col];
+        } else {
+            tileA[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+        
+        /* Load tile of B into shared memory */
+        uint b_row = t * 16 + gl_LocalInvocationID.y;
+        if (b_row < K && col < N) {
+            tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = B[b_row * N + col];
+        } else {
+            tileB[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+        }
+        
+        barrier();
+        
+        /* Accumulate tile product */
+        for (uint k = 0; k < 16; k++) {
+            sum += tileA[gl_LocalInvocationID.y][k] * tileB[k][gl_LocalInvocationID.x];
+        }
+        
+        barrier();
+    }
+    
+    C[row * N + col] = sum * scale;
+}

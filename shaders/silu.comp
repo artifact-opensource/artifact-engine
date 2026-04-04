@@ -1,0 +1,29 @@
+/*
+ * SiLU Activation — Artifact Engine
+ * silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ * Used in the FFN gate.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufX { float X[]; };  /* in-place */
+
+layout(push_constant) uniform Params {
+    uint M;  /* number of elements */
+    uint N;
+    uint K;
+    uint stride;
+    float scale;
+    uint offset;
+    uint head_dim;
+    uint n_heads;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= M) return;
+    
+    float x = X[idx];
+    X[idx] = x / (1.0 + exp(-x));
+}

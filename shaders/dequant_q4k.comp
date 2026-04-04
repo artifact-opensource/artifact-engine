@@ -1,0 +1,110 @@
+/*
+ * Q4_K Dequantization + Matrix Multiply — Artifact Engine
+ *
+ * Q4_K format (per block of 256 elements):
+ *   - 2 × fp16 super-block scales (d, dmin)
+ *   - 12 bytes of scales (6-bit quantized, for 8 sub-blocks of 32)
+ *   - 128 bytes of quantized values (4-bit, 256 values)
+ *   Total: 144 bytes per 256 elements
+ *
+ * This shader dequantizes A (quantized) and multiplies by B (fp32)
+ * in a fused operation to minimize memory bandwidth.
+ *
+ * C[row] = sum over k of: dequant(A[row, k]) * B[k, col]
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+/* Q4_K block structure (144 bytes per block of 256 elements) */
+struct block_q4_k {
+    uint d_dmin;        /* fp16 d and fp16 dmin packed into uint32 */
+    uint scales[3];     /* 12 bytes = 3 uint32s, 6-bit quantized scales */
+    uint qs[32];        /* 128 bytes = 32 uint32s, 4-bit quantized values */
+};
+
+layout(set = 0, binding = 0) readonly  buffer BufA { uint A_raw[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer BufC { float C[]; };
+
+layout(push_constant) uniform Params {
+    uint M;      /* rows of A (and C) */
+    uint N;      /* cols of B (and C) */
+    uint K;      /* number of columns in A (elements, not blocks) */
+    uint stride; /* bytes per row of A in blocks */
+    float scale;
+    uint offset;
+    uint head_dim;
+    uint n_heads;
+};
+
+/* Unpack fp16 from uint32 */
+float unpack_fp16_lo(uint packed) {
+    return unpackHalf2x16(packed).x;
+}
+
+float unpack_fp16_hi(uint packed) {
+    return unpackHalf2x16(packed).y;
+}
+
+/* Extract 6-bit scale from the scales array */
+float get_scale(uint scales[3], uint sub_block, float d, float dmin) {
+    /* 8 sub-blocks, each has a 6-bit scale and 6-bit min */
+    /* Packed into 12 bytes (96 bits for 8×6 scales + 8×6 mins) */
+    uint byte_idx = sub_block;
+    uint word_idx = byte_idx / 4;
+    uint bit_offset = (byte_idx % 4) * 8;
+    uint raw = (scales[word_idx] >> bit_offset) & 0x3F;
+    return d * float(raw);
+}
+
+void main() {
+    /* Each thread computes one element of C */
+    uint row = gl_GlobalInvocationID.x / N;
+    uint col = gl_GlobalInvocationID.x % N;
+    
+    if (row >= M || col >= N) return;
+    
+    float sum = 0.0;
+    
+    /* Number of Q4_K blocks per row */
+    uint n_blocks = K / 256;
+    uint block_words = 36; /* 144 bytes / 4 = 36 uint32s per block */
+    
+    for (uint blk = 0; blk < n_blocks; blk++) {
+        uint blk_offset = row * n_blocks * block_words + blk * block_words;
+        
+        /* Read block header */
+        uint d_dmin = A_raw[blk_offset];
+        float d    = unpack_fp16_lo(d_dmin);
+        float dmin = unpack_fp16_hi(d_dmin);
+        
+        /* Read scales (3 uint32s = 12 bytes) */
+        uint sc[3];
+        sc[0] = A_raw[blk_offset + 1];
+        sc[1] = A_raw[blk_offset + 2];
+        sc[2] = A_raw[blk_offset + 3];
+        
+        /* Read and dequantize 256 values in 8 sub-blocks of 32 */
+        uint qs_offset = blk_offset + 4; /* skip header + scales */
+        
+        for (uint sb = 0; sb < 8; sb++) {
+            float block_scale = get_scale(sc, sb, d, dmin);
+            
+            /* Each sub-block has 32 values packed as 16 bytes (4-bit each) */
+            for (uint j = 0; j < 4; j++) { /* 4 uint32s = 16 bytes = 32 nibbles */
+                uint packed = A_raw[qs_offset + sb * 4 + j];
+                
+                for (uint n = 0; n < 8; n++) {
+                    uint nibble = (packed >> (n * 4)) & 0xF;
+                    float val = block_scale * (float(nibble) - 8.0);
+                    
+                    uint k_idx = blk * 256 + sb * 32 + j * 8 + n;
+                    sum += val * B[k_idx * N + col];
+                }
+            }
+        }
+    }
+    
+    C[row * N + col] = sum;
+}

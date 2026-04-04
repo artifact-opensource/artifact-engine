@@ -1,0 +1,24 @@
+/*
+ * Token Embedding Lookup — Artifact Engine
+ * Copies the embedding vector for a given token ID.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufTable { float Table[]; };
+layout(set = 0, binding = 1) writeonly buffer BufOut   { float Out[]; };
+
+layout(push_constant) uniform Params {
+    uint M;      /* token_id */
+    uint N;      /* embedding dim */
+    uint K;      /* output row offset */
+    uint stride;
+    float scale; uint offset; uint head_dim; uint n_heads;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N) return;
+    Out[K * N + idx] = Table[M * N + idx];
+}

@@ -1,0 +1,60 @@
+/*
+ * RMS Layer Normalization — Artifact Engine
+ * out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i]
+ *
+ * Each workgroup handles one row (one token's hidden state).
+ * Two-pass: first compute sum of squares, then normalize.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly  buffer BufX      { float X[]; };
+layout(set = 0, binding = 1) readonly  buffer BufWeight  { float W[]; };
+layout(set = 0, binding = 2) writeonly buffer BufOut     { float Out[]; };
+
+layout(push_constant) uniform Params {
+    uint M;      /* number of rows (tokens) */
+    uint N;      /* number of cols (hidden_size) */
+    uint K;      /* unused */
+    uint stride; /* unused */
+    float scale; /* eps */
+    uint offset; /* row offset */
+    uint head_dim;
+    uint n_heads;
+};
+
+shared float partial_sum[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x + offset;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= M) return;
+    
+    /* Pass 1: Sum of squares (parallel reduction) */
+    float sum_sq = 0.0;
+    for (uint i = tid; i < N; i += 256) {
+        float val = X[row * N + i];
+        sum_sq += val * val;
+    }
+    partial_sum[tid] = sum_sq;
+    barrier();
+    
+    /* Reduce within workgroup */
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sum[tid] += partial_sum[tid + s];
+        }
+        barrier();
+    }
+    
+    /* RMS = sqrt(mean(x^2) + eps) */
+    float rms = sqrt(partial_sum[0] / float(N) + scale);
+    float inv_rms = 1.0 / rms;
+    
+    /* Pass 2: Normalize and scale by weight */
+    for (uint i = tid; i < N; i += 256) {
+        Out[row * N + i] = X[row * N + i] * inv_rms * W[i];
+    }
+}

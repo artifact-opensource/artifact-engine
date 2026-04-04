@@ -1,0 +1,81 @@
+/*
+ * Rotary Position Embedding (RoPE) — Artifact Engine
+ * Applies rotary position encoding to Q and K tensors.
+ *
+ * For each pair (x[2i], x[2i+1]):
+ *   freq = 1.0 / (base^(2i/dim))
+ *   cos_val = cos(position * freq)
+ *   sin_val = sin(position * freq)
+ *   out[2i]   = x[2i]   * cos_val - x[2i+1] * sin_val
+ *   out[2i+1] = x[2i]   * sin_val + x[2i+1] * cos_val
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufQ { float Q[]; };  /* in-place */
+layout(set = 0, binding = 1) buffer BufK { float K[]; };  /* in-place */
+
+layout(push_constant) uniform Params {
+    uint M;         /* number of tokens in this batch */
+    uint N;         /* total Q size per token (n_heads * head_dim) */
+    uint K_size;    /* total K size per token (n_kv_heads * head_dim) */
+    uint stride;    /* unused */
+    float scale;    /* freq_base (e.g. 10000.0 or 1000000.0) */
+    uint offset;    /* starting position index */
+    uint head_dim;
+    uint n_heads;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    
+    /* Each thread handles one pair across all tokens */
+    uint pair_idx = idx;  /* which (2i, 2i+1) pair within a head */
+    uint half_dim = head_dim / 2;
+    
+    /* Process Q heads */
+    for (uint token = 0; token < M; token++) {
+        uint pos = offset + token;
+        
+        for (uint h = 0; h < n_heads; h++) {
+            uint base_q = token * N + h * head_dim;
+            
+            if (pair_idx < half_dim) {
+                float freq = 1.0 / pow(scale, float(2 * pair_idx) / float(head_dim));
+                float angle = float(pos) * freq;
+                float cos_val = cos(angle);
+                float sin_val = sin(angle);
+                
+                uint i0 = base_q + 2 * pair_idx;
+                uint i1 = base_q + 2 * pair_idx + 1;
+                
+                float q0 = Q[i0];
+                float q1 = Q[i1];
+                Q[i0] = q0 * cos_val - q1 * sin_val;
+                Q[i1] = q0 * sin_val + q1 * cos_val;
+            }
+        }
+        
+        /* Process K heads (may have fewer heads due to GQA) */
+        uint n_kv_heads = K_size / head_dim;
+        for (uint h = 0; h < n_kv_heads; h++) {
+            uint base_k = token * K_size + h * head_dim;
+            
+            if (pair_idx < half_dim) {
+                float freq = 1.0 / pow(scale, float(2 * pair_idx) / float(head_dim));
+                float angle = float(pos) * freq;
+                float cos_val = cos(angle);
+                float sin_val = sin(angle);
+                
+                uint i0 = base_k + 2 * pair_idx;
+                uint i1 = base_k + 2 * pair_idx + 1;
+                
+                float k0 = K[i0];
+                float k1 = K[i1];
+                K[i0] = k0 * cos_val - k1 * sin_val;
+                K[i1] = k0 * sin_val + k1 * cos_val;
+            }
+        }
+    }
+}

@@ -1,0 +1,82 @@
+/*
+ * Softmax — Artifact Engine
+ * softmax(x)[i] = exp(x[i] - max(x)) / sum(exp(x[j] - max(x)))
+ *
+ * Numerically stable implementation with max subtraction.
+ * Each workgroup handles one row.
+ */
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer BufX { float X[]; };  /* in-place */
+
+layout(push_constant) uniform Params {
+    uint M;      /* number of rows */
+    uint N;      /* number of cols (softmax dimension) */
+    uint K;
+    uint stride;
+    float scale; /* pre-scale factor (e.g. 1/sqrt(d_k)) */
+    uint offset;
+    uint head_dim;
+    uint n_heads;
+};
+
+shared float shared_data[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (row >= M) return;
+    
+    uint base = row * N;
+    
+    /* Apply scale factor */
+    if (scale != 1.0) {
+        for (uint i = tid; i < N; i += 256) {
+            X[base + i] *= scale;
+        }
+        barrier();
+    }
+    
+    /* Pass 1: Find max (parallel reduction) */
+    float local_max = -1e30;
+    for (uint i = tid; i < N; i += 256) {
+        local_max = max(local_max, X[base + i]);
+    }
+    shared_data[tid] = local_max;
+    barrier();
+    
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + s]);
+        }
+        barrier();
+    }
+    float row_max = shared_data[0];
+    
+    /* Pass 2: exp(x - max) and sum */
+    float local_sum = 0.0;
+    for (uint i = tid; i < N; i += 256) {
+        float val = exp(X[base + i] - row_max);
+        X[base + i] = val;
+        local_sum += val;
+    }
+    shared_data[tid] = local_sum;
+    barrier();
+    
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_data[tid] += shared_data[tid + s];
+        }
+        barrier();
+    }
+    float row_sum = shared_data[0];
+    
+    /* Pass 3: Normalize */
+    float inv_sum = 1.0 / row_sum;
+    for (uint i = tid; i < N; i += 256) {
+        X[base + i] *= inv_sum;
+    }
+}
