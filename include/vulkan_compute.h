@@ -54,6 +54,8 @@ typedef enum {
     SHADER_MUL,
     SHADER_COPY,
     SHADER_SAMPLE,
+    SHADER_KV_CACHE_STORE,
+    SHADER_GQA_ATTENTION,
     SHADER_COUNT
 } shader_id;
 
@@ -183,6 +185,21 @@ void vk_mul(vk_context* ctx,
 void vk_embedding(vk_context* ctx,
                   const gpu_buffer* table, gpu_buffer* out,
                   uint32_t token_id, uint32_t dim);
+
+/* Store K/V vectors into KV cache at given position */
+void vk_kv_cache_store(vk_context* ctx,
+                       const gpu_buffer* kv_current, gpu_buffer* kv_cache,
+                       uint32_t kv_dim, uint32_t pos, uint32_t max_seq);
+
+/* Grouped-Query Attention with KV cache */
+void vk_gqa_attention(vk_context* ctx,
+                      const gpu_buffer* q,
+                      const gpu_buffer* k_cache,
+                      const gpu_buffer* v_cache,
+                      gpu_buffer* attn_scores,
+                      gpu_buffer* attn_out,
+                      uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
+                      uint32_t seq_len, uint32_t max_seq, uint32_t current_pos);
 
 /* ─── Diagnostics ─── */
 

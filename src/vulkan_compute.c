@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <math.h>
 
 /* ───── Shader filenames (match shader_id enum order) ───── */
 static const char* shader_names[SHADER_COUNT] = {
@@ -35,10 +36,12 @@ static const char* shader_names[SHADER_COUNT] = {
     [SHADER_MUL]         = "mul.spv",
     [SHADER_COPY]        = "matmul.spv",         /* placeholder */
     [SHADER_SAMPLE]      = "matmul.spv",         /* placeholder */
+    [SHADER_KV_CACHE_STORE] = "kv_cache_store.spv",
+    [SHADER_GQA_ATTENTION]  = "attention.spv",
 };
 
-/* Max bindings per shader (we use up to 3: A, B, C) */
-#define MAX_BINDINGS 4
+/* Max bindings per shader (we use up to 5 for attention: Q, K_cache, V_cache, scores, out) */
+#define MAX_BINDINGS 5
 
 /* Number of bindings each shader uses */
 static const uint32_t shader_binding_count[SHADER_COUNT] = {
@@ -57,6 +60,8 @@ static const uint32_t shader_binding_count[SHADER_COUNT] = {
     [SHADER_MUL]         = 3,
     [SHADER_COPY]        = 2,
     [SHADER_SAMPLE]      = 2,
+    [SHADER_KV_CACHE_STORE] = 2,
+    [SHADER_GQA_ATTENTION]  = 5,
 };
 
 /* ───── Helper: Check Vulkan result ───── */
@@ -634,6 +639,38 @@ void vk_embedding(vk_context* ctx,
     const gpu_buffer* bufs[] = { table, out };
     push_constants pc = { .M = token_id, .N = dim, .K = 0 };
     vk_dispatch(ctx, SHADER_EMBEDDING, bufs, 2, &pc, (dim + 255) / 256, 1, 1);
+}
+
+void vk_kv_cache_store(vk_context* ctx,
+                       const gpu_buffer* kv_current, gpu_buffer* kv_cache,
+                       uint32_t kv_dim, uint32_t pos, uint32_t max_seq) {
+    const gpu_buffer* bufs[] = { kv_current, kv_cache };
+    push_constants pc = { .M = kv_dim, .N = pos, .K = max_seq };
+    vk_dispatch(ctx, SHADER_KV_CACHE_STORE, bufs, 2, &pc, (kv_dim + 255) / 256, 1, 1);
+}
+
+void vk_gqa_attention(vk_context* ctx,
+                      const gpu_buffer* q,
+                      const gpu_buffer* k_cache,
+                      const gpu_buffer* v_cache,
+                      gpu_buffer* attn_scores,
+                      gpu_buffer* attn_out,
+                      uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
+                      uint32_t seq_len, uint32_t max_seq, uint32_t current_pos) {
+    const gpu_buffer* bufs[] = { q, k_cache, v_cache, attn_scores, attn_out };
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    push_constants pc = {
+        .M = head_dim,
+        .N = n_heads,
+        .K = n_kv_heads,
+        .stride = seq_len,
+        .scale = attn_scale,
+        .offset = current_pos,
+        .head_dim = max_seq,
+        .n_heads = 0  /* pad */
+    };
+    /* One workgroup per attention head */
+    vk_dispatch(ctx, SHADER_GQA_ATTENTION, bufs, 5, &pc, n_heads, 1, 1);
 }
 
 /* ───── Diagnostics ───── */

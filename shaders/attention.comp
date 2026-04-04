@@ -1,0 +1,130 @@
+#version 450
+
+/*
+ * Grouped-Query Attention (GQA) — Full multi-head attention with KV cache
+ *
+ * For each query head h:
+ *   kv_head = h / (n_heads / n_kv_heads)      // GQA group mapping
+ *   For each position p in [0, seq_len]:
+ *     score[p] = dot(Q[h], K_cache[kv_head, p]) / sqrt(head_dim)
+ *   Apply causal mask: score[p] = -inf if p > current_pos
+ *   Softmax over scores
+ *   out[h] = sum_p(score[p] * V_cache[kv_head, p])
+ *
+ * One workgroup per head. Each invocation handles part of the dot products.
+ */
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Q       { float q_data[]; };       /* [n_heads * head_dim] */
+layout(binding = 1) readonly buffer KCache  { float k_cache[]; };      /* [max_seq * n_kv_heads * head_dim] */
+layout(binding = 2) readonly buffer VCache  { float v_cache[]; };      /* [max_seq * n_kv_heads * head_dim] */
+layout(binding = 3) buffer AttnScores       { float scores[]; };       /* [n_heads * max_seq] — scratch for scores */
+layout(binding = 4) writeonly buffer Output { float attn_out[]; };     /* [n_heads * head_dim] */
+
+layout(push_constant) uniform Params {
+    uint head_dim;      /* maps to M */
+    uint n_heads;       /* maps to N */
+    uint n_kv_heads;    /* maps to K */
+    uint seq_len;       /* maps to stride */
+    float scale;        /* maps to scale */
+    uint current_pos;   /* maps to offset */
+    uint max_seq;       /* maps to head_dim field */
+    uint pad0;          /* maps to n_heads field */
+};
+
+shared float s_dot[256];
+shared float s_max;
+shared float s_sum;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+    
+    if (head >= n_heads) return;
+    
+    /* GQA: map query head to KV head */
+    uint heads_per_kv = n_heads / n_kv_heads;
+    uint kv_head = head / heads_per_kv;
+    
+    uint q_offset = head * head_dim;
+    uint kv_stride = n_kv_heads * head_dim;  /* stride between positions in cache */
+    uint kv_head_offset = kv_head * head_dim;
+    uint score_offset = head * max_seq;
+    
+    /* ─── Phase 1: Compute attention scores Q·K^T / sqrt(d) ─── */
+    for (uint p = 0; p < seq_len; p++) {
+        /* Dot product Q[head] · K_cache[kv_head, p] */
+        float partial = 0.0;
+        for (uint d = tid; d < head_dim; d += 256) {
+            float q_val = q_data[q_offset + d];
+            float k_val = k_cache[p * kv_stride + kv_head_offset + d];
+            partial += q_val * k_val;
+        }
+        
+        /* Reduce within workgroup */
+        s_dot[tid] = partial;
+        barrier();
+        
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s && tid + s < 256) {
+                s_dot[tid] += s_dot[tid + s];
+            }
+            barrier();
+        }
+        
+        if (tid == 0) {
+            float dot_val = s_dot[0] * scale;
+            /* Causal mask: future positions get -inf */
+            if (p > current_pos) {
+                dot_val = -1e30;
+            }
+            scores[score_offset + p] = dot_val;
+        }
+        barrier();
+    }
+    
+    /* ─── Phase 2: Softmax over scores[0..seq_len-1] ─── */
+    /* Find max */
+    if (tid == 0) {
+        float mx = -1e30;
+        for (uint p = 0; p < seq_len; p++) {
+            mx = max(mx, scores[score_offset + p]);
+        }
+        s_max = mx;
+    }
+    barrier();
+    
+    /* Exp and sum */
+    if (tid == 0) {
+        float sm = 0.0;
+        for (uint p = 0; p < seq_len; p++) {
+            float v = exp(scores[score_offset + p] - s_max);
+            scores[score_offset + p] = v;
+            sm += v;
+        }
+        s_sum = sm;
+    }
+    barrier();
+    
+    /* Normalize */
+    if (tid == 0) {
+        float inv_sum = 1.0 / s_sum;
+        for (uint p = 0; p < seq_len; p++) {
+            scores[score_offset + p] *= inv_sum;
+        }
+    }
+    barrier();
+    
+    /* ─── Phase 3: Weighted sum of V ─── */
+    /* out[head, d] = sum_p(score[p] * V_cache[kv_head, p, d]) */
+    for (uint d = tid; d < head_dim; d += 256) {
+        float acc = 0.0;
+        for (uint p = 0; p < seq_len; p++) {
+            float w = scores[score_offset + p];
+            float v_val = v_cache[p * kv_stride + kv_head_offset + d];
+            acc += w * v_val;
+        }
+        attn_out[q_offset + d] = acc;
+    }
+}

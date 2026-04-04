@@ -204,17 +204,22 @@ static void forward_layer(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 4. Store K, V into cache at position `pos` */
-    /* TODO: vk_copy into cache.k[layer] and cache.v[layer] at offset pos */
+    uint32_t kv_dim = n_kv * hd;
+    vk_kv_cache_store(&eng->vk, &eng->scratch.k, &eng->cache.k[layer],
+                      kv_dim, pos, eng->cache.max_seq);
+    vk_kv_cache_store(&eng->vk, &eng->scratch.v, &eng->cache.v[layer],
+                      kv_dim, pos, eng->cache.max_seq);
+    vk_barrier(&eng->vk);
     
-    /* 5. Attention scores: for each head, Q @ K^T / sqrt(d_k) */
-    /* TODO: multi-head attention with GQA support */
-    /* For MVP: simplified single-head-at-a-time attention */
-    
-    /* 6. Softmax attention weights */
-    /* TODO: causal mask */
-    
-    /* 7. Attention output = weights @ V */
-    /* TODO */
+    /* 5-7. Multi-head attention with GQA and causal masking */
+    vk_gqa_attention(&eng->vk,
+                     &eng->scratch.q,
+                     &eng->cache.k[layer],
+                     &eng->cache.v[layer],
+                     &eng->scratch.attn_scores,
+                     &eng->scratch.attn_out,
+                     hd, n_heads, n_kv, pos + 1, eng->cache.max_seq, pos);
+    vk_barrier(&eng->vk);
     
     /* 8. Output projection */
     vk_matmul(&eng->vk, &eng->scratch.attn_out, &eng->weights.layers[layer].wo,

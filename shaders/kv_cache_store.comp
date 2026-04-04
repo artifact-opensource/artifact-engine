@@ -1,0 +1,28 @@
+#version 450
+
+/*
+ * KV Cache Store — Copies current K/V vectors into the KV cache at position `pos`
+ *
+ * Layout: cache[pos * n_kv_heads * head_dim ... (pos+1) * n_kv_heads * head_dim]
+ *
+ * Workgroup: (n_kv_heads * head_dim, 1, 1)
+ */
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Src { float src[]; };   /* current K or V [n_kv_heads * head_dim] */
+layout(binding = 1) buffer Cache { float cache[]; };         /* KV cache [max_seq * n_kv_heads * head_dim] */
+
+layout(push_constant) uniform Params {
+    uint kv_dim;     /* maps to M — n_kv_heads * head_dim */
+    uint pos;        /* maps to N — current position in sequence */
+    uint max_seq;    /* maps to K — max sequence length (unused, for bounds) */
+    uint pad0;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= kv_dim) return;
+    
+    cache[pos * kv_dim + idx] = src[idx];
+}
