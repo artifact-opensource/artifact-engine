@@ -18,6 +18,10 @@
 #include <string.h>
 #include <signal.h>
 
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
 #define VERSION "0.1.0"
 
 static volatile int running = 1;
@@ -90,9 +94,74 @@ int main(int argc, char** argv) {
     }
     
     if (!model_path) {
-        fprintf(stderr, "Error: --model is required\n\n");
-        print_usage(argv[0]);
-        return 1;
+        /* Auto-detect: scan for .gguf files in common locations */
+        static char auto_path[512];
+#ifdef _WIN32
+        /* Check LocalState (UWP app data) */
+        const char* local_appdata = getenv("LOCALAPPDATA");
+        const char* scan_dirs[] = {
+            ".",
+            "models",
+            "D:\\DevelopmentFiles",
+            "D:\\DevelopmentFiles\\WdpTempWebFolder",
+            "D:\\DevelopmentFiles\\models",
+            "C:\\Users\\ali\\models",
+            NULL
+        };
+        
+        /* Try LocalState first (Xbox UWP) */
+        if (local_appdata) {
+            WIN32_FIND_DATAA fd;
+            char search[512];
+            snprintf(search, sizeof(search), "%s\\..\\LocalState\\*.gguf", local_appdata);
+            HANDLE h = FindFirstFileA(search, &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                snprintf(auto_path, sizeof(auto_path), "%s\\..\\LocalState\\%s", 
+                         local_appdata, fd.cFileName);
+                model_path = auto_path;
+                FindClose(h);
+            }
+        }
+        
+        /* Then try each scan dir */
+        if (!model_path) {
+            for (int d = 0; scan_dirs[d] && !model_path; d++) {
+                WIN32_FIND_DATAA fd;
+                char search[512];
+                snprintf(search, sizeof(search), "%s\\*.gguf", scan_dirs[d]);
+                HANDLE h = FindFirstFileA(search, &fd);
+                if (h != INVALID_HANDLE_VALUE) {
+                    snprintf(auto_path, sizeof(auto_path), "%s\\%s", 
+                             scan_dirs[d], fd.cFileName);
+                    model_path = auto_path;
+                    FindClose(h);
+                }
+            }
+        }
+#else
+        /* Linux: scan current dir and models/ */
+        const char* scan_dirs[] = {".", "models", NULL};
+        /* Simple approach: just check if models/*.gguf exists */
+        FILE* fp;
+        for (int d = 0; scan_dirs[d] && !model_path; d++) {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "ls %s/*.gguf 2>/dev/null | head -1", scan_dirs[d]);
+            fp = popen(cmd, "r");
+            if (fp) {
+                if (fgets(auto_path, sizeof(auto_path), fp)) {
+                    auto_path[strcspn(auto_path, "\n")] = 0;
+                    if (auto_path[0]) model_path = auto_path;
+                }
+                pclose(fp);
+            }
+        }
+#endif
+        if (!model_path) {
+            fprintf(stderr, "Error: --model is required (or place a .gguf file in current dir)\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        printf("Auto-detected model: %s\n", model_path);
     }
     
     /* ─── Info Mode: Just load and print ─── */
