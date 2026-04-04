@@ -23,7 +23,7 @@
   #include <windows.h>
 #endif
 
-#define VERSION "0.1.0"
+#define VERSION "0.4.0"
 
 static volatile int running = 1;
 
@@ -60,7 +60,78 @@ static void print_usage(const char* argv0) {
     printf("  GET  /health                 Health check\n");
 }
 
+#ifdef _WIN32
+/* Xbox/UWP needs a message loop to stay alive. Run engine in a thread. */
+static DWORD WINAPI engine_thread(LPVOID param);
+static int g_argc;
+static char** g_argv;
+
+/* Minimal hidden window + message pump for Xbox process lifetime */
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+static void run_message_pump(void) {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "ArtifactEngine";
+    RegisterClassA(&wc);
+    
+    /* Create a hidden window — Xbox needs this to keep the process alive */
+    HWND hwnd = CreateWindowA("ArtifactEngine", "Artifact Engine", 
+                               0, 0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
+    (void)hwnd;
+    
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+}
+#endif
+
+int engine_main(int argc, char** argv);
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    /* Redirect stdout/stderr to a log file for debugging on Xbox */
+    const char* appdata = getenv("LOCALAPPDATA");
+    if (appdata) {
+        char logpath[512];
+        snprintf(logpath, sizeof(logpath), "%s\\..\\LocalState\\engine.log", appdata);
+        FILE* lf = fopen(logpath, "w");
+        if (lf) { fclose(lf); freopen(logpath, "w", stdout); freopen(logpath, "a", stderr); }
+    }
+    
+    /* Start engine in a background thread */
+    g_argc = argc;
+    g_argv = argv;
+    CreateThread(NULL, 0, engine_thread, NULL, 0, NULL);
+    
+    /* Run message pump on main thread (keeps Xbox from killing us) */
+    run_message_pump();
+    return 0;
+#else
+    return engine_main(argc, argv);
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI engine_thread(LPVOID param) {
+    (void)param;
+    int ret = engine_main(g_argc, g_argv);
+    if (ret != 0) {
+        fprintf(stderr, "Engine exited with code %d\n", ret);
+        /* Don't exit — keep the process alive for debugging via log file */
+        Sleep(INFINITE);
+    }
+    return ret;
+}
+#endif
+
+int engine_main(int argc, char** argv) {
     const char* model_path = NULL;
     const char* pull_url = NULL;
     const char* shader_dir = "./shaders";
@@ -148,6 +219,12 @@ int main(int argc, char** argv) {
             "D:\\DevelopmentFiles\\models",
             "D:\\DevelopmentFiles\\WdpTempWebFolder",
             "C:\\Users\\ali\\models",
+            /* Edge download locations (Xbox user profiles) */
+            "Q:\\Users\\UserMgr0\\Downloads",
+            "Q:\\Users\\DefaultAccount\\Downloads",
+            "Q:\\Users\\UserMgr0\\Desktop",
+            /* Edge app container download paths */
+            "Q:\\Users\\UserMgr0\\AppData\\Local\\Packages\\Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe\\LocalCache\\Local\\Microsoft\\Edge\\User Data\\Default\\Downloads",
             NULL
         };
         
