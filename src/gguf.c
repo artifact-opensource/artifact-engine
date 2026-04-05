@@ -125,9 +125,7 @@ static bool read_value(reader* r, gguf_type type, gguf_kv* kv) {
         case GGUF_TYPE_ARRAY: {
             kv->value.arr.elem_type = (gguf_type)read_u32(r);
             kv->value.arr.count = read_u64(r);
-            /* For arrays, we store the raw offset — data is accessed lazily */
             kv->value.arr.data = (void*)(uintptr_t)r->pos;
-            /* Skip past the array data */
             for (uint64_t i = 0; i < kv->value.arr.count; i++) {
                 switch (kv->value.arr.elem_type) {
                     case GGUF_TYPE_UINT8: case GGUF_TYPE_INT8: case GGUF_TYPE_BOOL:
@@ -140,7 +138,7 @@ static bool read_value(reader* r, gguf_type type, gguf_kv* kv) {
                         r->pos += 8; break;
                     case GGUF_TYPE_STRING: {
                         gguf_string s = read_string(r);
-                        free(s.data); /* we don't store individual array strings yet */
+                        free(s.data);
                         break;
                     }
                     default:
@@ -179,7 +177,7 @@ static void* mmap_file(const char* path, size_t* out_size, void** handle_out) {
     
     if (!addr) return NULL;
     *out_size = (size_t)size.QuadPart;
-    *handle_out = addr; /* store for UnmapViewOfFile */
+    *handle_out = addr;
     return addr;
 }
 
@@ -202,7 +200,6 @@ static void* mmap_file(const char* path, size_t* out_size, void** handle_out) {
     
     if (addr == MAP_FAILED) return NULL;
     
-    /* Advise the kernel we'll read sequentially */
     madvise(addr, st.st_size, MADV_SEQUENTIAL);
     
     *out_size = st.st_size;
@@ -222,7 +219,6 @@ gguf_file* gguf_load(const char* path) {
     gguf_file* gf = calloc(1, sizeof(gguf_file));
     if (!gf) return NULL;
     
-    /* Memory-map the file */
     gf->mmap_addr = mmap_file(path, &gf->mmap_size, &gf->mmap_addr);
     if (!gf->mmap_addr) {
         fprintf(stderr, "gguf: failed to mmap '%s': %s\n", path, strerror(errno));
@@ -232,7 +228,6 @@ gguf_file* gguf_load(const char* path) {
     
     reader r = { .data = (const uint8_t*)gf->mmap_addr, .size = gf->mmap_size, .pos = 0 };
     
-    /* ─── Header ─── */
     if (!reader_has(&r, 24)) goto fail;
     
     uint32_t magic = read_u32(&r);
@@ -253,7 +248,6 @@ gguf_file* gguf_load(const char* path) {
     printf("gguf: version=%u, tensors=%lu, kv_pairs=%lu\n",
            gf->version, (unsigned long)gf->n_tensors, (unsigned long)gf->n_kv);
     
-    /* ─── Key-Value Pairs ─── */
     gf->kv = calloc(gf->n_kv, sizeof(gguf_kv));
     if (!gf->kv) goto fail;
     
@@ -265,7 +259,6 @@ gguf_file* gguf_load(const char* path) {
         if (!read_value(&r, vtype, &gf->kv[i])) goto fail;
     }
     
-    /* ─── Tensor Infos ─── */
     gf->tensors = calloc(gf->n_tensors, sizeof(gguf_tensor_info));
     if (!gf->tensors) goto fail;
     
@@ -285,7 +278,6 @@ gguf_file* gguf_load(const char* path) {
             ti->dims[d] = read_u64(&r);
             ti->n_elements *= ti->dims[d];
         }
-        /* Zero remaining dims */
         for (uint32_t d = ti->n_dims; d < GGML_MAX_DIMS; d++) {
             ti->dims[d] = 1;
         }
@@ -293,7 +285,6 @@ gguf_file* gguf_load(const char* path) {
         ti->type   = (ggml_type)read_u32(&r);
         ti->offset = read_u64(&r);
         
-        /* Compute byte size */
         size_t block_size = ggml_type_block_size(ti->type);
         size_t bytes_per_block = ggml_type_bytes_per_block(ti->type);
         if (block_size == 0 || bytes_per_block == 0) {
@@ -304,8 +295,6 @@ gguf_file* gguf_load(const char* path) {
         ti->n_bytes = (ti->n_elements / block_size) * bytes_per_block;
     }
     
-    /* ─── Data Section ─── */
-    /* Align to 32 bytes (GGUF spec) */
     size_t alignment = 32;
     const gguf_kv* align_kv = gguf_find_kv(gf, "general.alignment");
     if (align_kv && align_kv->type == GGUF_TYPE_UINT32) {
@@ -394,6 +383,17 @@ float gguf_get_f32(const gguf_file* gf, const char* key, float def) {
     }
 }
 
+static bool gguf_get_bool(const gguf_file* gf, const char* key, bool def) {
+    const gguf_kv* kv = gguf_find_kv(gf, key);
+    if (!kv) return def;
+    switch (kv->type) {
+        case GGUF_TYPE_BOOL:    return kv->value.b;
+        case GGUF_TYPE_UINT8:   return kv->value.u8 != 0;
+        case GGUF_TYPE_UINT32:  return kv->value.u32 != 0;
+        default: return def;
+    }
+}
+
 const gguf_tensor_info* gguf_find_tensor(const gguf_file* gf, const char* name) {
     for (uint64_t i = 0; i < gf->n_tensors; i++) {
         if (gf->tensors[i].name.data && strcmp(gf->tensors[i].name.data, name) == 0) {
@@ -417,7 +417,6 @@ bool gguf_extract_arch(const gguf_file* gf, model_arch* arch) {
         strcpy(arch->arch, "unknown");
     }
     
-    /* Build key prefix from architecture name */
     char prefix[128];
     snprintf(prefix, sizeof(prefix), "%s.", arch->arch);
     
@@ -431,6 +430,10 @@ bool gguf_extract_arch(const gguf_file* gf, model_arch* arch) {
         snprintf(key, sizeof(key), "%s%s", prefix, name); \
         arch->field = gguf_get_f32(gf, key, def)
     
+    #define GET_ARCH_BOOL(field, name, def) \
+        snprintf(key, sizeof(key), "%s%s", prefix, name); \
+        arch->field = gguf_get_bool(gf, key, def)
+    
     GET_ARCH_U32(vocab_size,        "vocab_size",            0);
     GET_ARCH_U32(hidden_size,       "embedding_length",      0);
     GET_ARCH_U32(n_layers,          "block_count",           0);
@@ -441,8 +444,26 @@ bool gguf_extract_arch(const gguf_file* gf, model_arch* arch) {
     GET_ARCH_F32(rope_freq_base,    "rope.freq_base",        10000.0f);
     GET_ARCH_F32(rms_norm_eps,      "attention.layer_norm_rms_epsilon", 1e-6f);
     
+    /* Hybrid architecture: DeltaNet + Attention or Mamba + Attention */
+    GET_ARCH_U32(full_attn_interval, "full_attention_interval", 0);
+    
+    /* SSM parameters (DeltaNet / Mamba / Mamba-2) */
+    GET_ARCH_U32(ssm_d_inner,       "ssm.inner_size",         0);
+    GET_ARCH_U32(ssm_d_state,       "ssm.state_size",         0);
+    GET_ARCH_U32(ssm_n_group,       "ssm.group_count",        0);
+    GET_ARCH_U32(ssm_dt_rank,       "ssm.time_step_rank",     0);
+    GET_ARCH_U32(ssm_conv_kernel,   "ssm.conv_kernel",        4);
+    
+    /* Mamba-2 specific */
+    GET_ARCH_U32(ssm_n_head,        "ssm.head_count",         0);
+    GET_ARCH_U32(ssm_d_in_proj,     "ssm.in_proj_size",       0);
+    
+    /* Mamba-1 variant flag: some models RMS-norm dt, B, C */
+    GET_ARCH_BOOL(ssm_dt_b_c_rms,   "ssm.dt_b_c_rms",        false);
+    
     #undef GET_ARCH_U32
     #undef GET_ARCH_F32
+    #undef GET_ARCH_BOOL
     
     /* Derived */
     if (arch->n_heads > 0) {
@@ -452,15 +473,47 @@ bool gguf_extract_arch(const gguf_file* gf, model_arch* arch) {
         arch->n_kv_heads = arch->n_heads; /* MHA if not specified */
     }
     
+    /* For pure Mamba models, attention heads may be 0.
+     * Derive Mamba-2 head count from ssm_d_inner if ssm_n_head is set. */
+    if (arch->ssm_n_head > 0 && arch->ssm_d_inner > 0) {
+        /* Mamba-2: dim_per_head = d_inner / n_head */
+    }
+    
+    /* For Mamba-1: if d_inner is 0 but hidden_size is set, d_inner defaults to 2*hidden */
+    if (strcmp(arch->arch, "mamba") == 0 && arch->ssm_d_inner == 0 && arch->hidden_size > 0) {
+        arch->ssm_d_inner = arch->hidden_size * 2;  /* Mamba convention */
+    }
+    
+    /* For Mamba-1: dt_rank defaults to hidden_size / 16 if not specified */
+    if (strcmp(arch->arch, "mamba") == 0 && arch->ssm_dt_rank == 0 && arch->hidden_size > 0) {
+        arch->ssm_dt_rank = arch->hidden_size / 16;
+    }
+    
+    /* For Mamba-2: derive n_group from ssm_d_inner if not set */
+    if (strcmp(arch->arch, "mamba2") == 0 && arch->ssm_n_group == 0) {
+        arch->ssm_n_group = 1;  /* default 1 group */
+    }
+    
     /* Tokenizer */
     arch->bos_token_id = gguf_get_u32(gf, "tokenizer.ggml.bos_token_id", 1);
     arch->eos_token_id = gguf_get_u32(gf, "tokenizer.ggml.eos_token_id", 2);
     arch->pad_token_id = gguf_get_u32(gf, "tokenizer.ggml.padding_token_id", 0);
     
-    /* Validate minimum requirements */
-    if (arch->hidden_size == 0 || arch->n_layers == 0 || arch->n_heads == 0) {
-        fprintf(stderr, "gguf: incomplete architecture: hidden=%u layers=%u heads=%u\n",
-                arch->hidden_size, arch->n_layers, arch->n_heads);
+    /* Validate minimum requirements:
+     * For attention-based models, need hidden + layers + heads.
+     * For pure Mamba models, heads may be 0 — validate differently. */
+    bool is_mamba_pure = (strcmp(arch->arch, "mamba") == 0 || 
+                          strcmp(arch->arch, "mamba2") == 0);
+    
+    if (arch->hidden_size == 0 || arch->n_layers == 0) {
+        fprintf(stderr, "gguf: incomplete architecture: hidden=%u layers=%u\n",
+                arch->hidden_size, arch->n_layers);
+        return false;
+    }
+    
+    if (!is_mamba_pure && arch->n_heads == 0) {
+        fprintf(stderr, "gguf: incomplete architecture: heads=%u (not a pure Mamba model)\n",
+                arch->n_heads);
         return false;
     }
     
@@ -474,7 +527,6 @@ void gguf_print_info(const gguf_file* gf) {
     printf("KV pairs:   %lu\n", (unsigned long)gf->n_kv);
     printf("Data size:  %.2f GB\n", (double)gf->data_size / (1024.0*1024.0*1024.0));
     
-    /* Print key metadata */
     const char* keys[] = {
         "general.architecture", "general.name",
         NULL
@@ -484,22 +536,76 @@ void gguf_print_info(const gguf_file* gf) {
         if (v) printf("%-30s = %s\n", keys[i], v);
     }
     
-    /* Print architecture */
     model_arch arch;
     if (gguf_extract_arch(gf, &arch)) {
         printf("\n─── Architecture: %s ───\n", arch.arch);
         printf("Vocab size:       %u\n", arch.vocab_size);
         printf("Hidden size:      %u\n", arch.hidden_size);
         printf("Layers:           %u\n", arch.n_layers);
-        printf("Attention heads:  %u (KV: %u)\n", arch.n_heads, arch.n_kv_heads);
-        printf("Head dim:         %u\n", arch.head_dim);
-        printf("FFN size:         %u\n", arch.intermediate_size);
+        if (arch.n_heads > 0) {
+            printf("Attention heads:  %u (KV: %u)\n", arch.n_heads, arch.n_kv_heads);
+            printf("Head dim:         %u\n", arch.head_dim);
+        }
+        if (arch.intermediate_size > 0) {
+            printf("FFN size:         %u\n", arch.intermediate_size);
+        }
         printf("Max context:      %u\n", arch.max_position);
-        printf("RoPE freq base:   %.1f\n", arch.rope_freq_base);
+        if (arch.n_heads > 0) {
+            printf("RoPE freq base:   %.1f\n", arch.rope_freq_base);
+        }
         printf("RMS norm eps:     %g\n", arch.rms_norm_eps);
+        
+        /* DeltaNet hybrid info */
+        if (arch.full_attn_interval > 0 && arch.ssm_d_inner > 0) {
+            printf("─── Hybrid Architecture (DeltaNet) ───\n");
+            printf("Attn interval:    every %u layers\n", arch.full_attn_interval);
+            printf("SSM inner size:   %u\n", arch.ssm_d_inner);
+            printf("SSM state size:   %u\n", arch.ssm_d_state);
+            printf("SSM group count:  %u (K heads)\n", arch.ssm_n_group);
+            printf("SSM dt rank:      %u (V heads)\n", arch.ssm_dt_rank);
+            printf("SSM conv kernel:  %u\n", arch.ssm_conv_kernel);
+            uint32_t n_attn = arch.n_layers / arch.full_attn_interval;
+            uint32_t n_delta = arch.n_layers - n_attn;
+            printf("Attention layers: %u | DeltaNet layers: %u\n", n_attn, n_delta);
+        }
+        
+        /* Pure Mamba / Mamba-2 info */
+        bool is_mamba = (strcmp(arch.arch, "mamba") == 0);
+        bool is_mamba2 = (strcmp(arch.arch, "mamba2") == 0);
+        bool is_jamba = (strcmp(arch.arch, "jamba") == 0);
+        bool is_falcon_h1 = (strcmp(arch.arch, "falcon_h1") == 0);
+        
+        if (is_mamba || is_mamba2) {
+            printf("─── %s Architecture ───\n", is_mamba ? "Mamba (S6)" : "Mamba-2 (SSD)");
+            printf("SSM inner size:   %u\n", arch.ssm_d_inner);
+            printf("SSM state size:   %u\n", arch.ssm_d_state);
+            printf("SSM conv kernel:  %u\n", arch.ssm_conv_kernel);
+            if (is_mamba) {
+                printf("SSM dt rank:      %u\n", arch.ssm_dt_rank);
+            }
+            if (is_mamba2) {
+                printf("SSM heads:        %u\n", arch.ssm_n_head);
+                printf("SSM groups:       %u\n", arch.ssm_n_group);
+            }
+            printf("All %u layers: %s\n", arch.n_layers, is_mamba ? "MAMBA" : "MAMBA2");
+        }
+        
+        if (is_jamba || is_falcon_h1) {
+            printf("─── Hybrid Architecture (%s) ───\n", arch.arch);
+            printf("SSM inner size:   %u\n", arch.ssm_d_inner);
+            printf("SSM state size:   %u\n", arch.ssm_d_state);
+            printf("SSM conv kernel:  %u\n", arch.ssm_conv_kernel);
+            if (arch.ssm_n_head > 0) {
+                printf("SSM heads:        %u\n", arch.ssm_n_head);
+            }
+            printf("SSM groups:       %u\n", arch.ssm_n_group);
+            if (arch.full_attn_interval > 0) {
+                printf("Attn interval:    every %u layers\n", arch.full_attn_interval);
+            }
+        }
     }
     
-    /* Print tensor types histogram */
+    /* Tensor type histogram */
     printf("\n─── Tensor Types ───\n");
     int type_counts[32] = {0};
     uint64_t type_bytes[32] = {0};
@@ -522,5 +628,12 @@ void gguf_print_info(const gguf_file* gf) {
         }
     }
     
+    printf("═══════════════════\n\n");
+    
+    printf("─── First 30 Tensor Names ───\n");
+    for (uint64_t i = 0; i < gf->n_tensors && i < 30; i++) {
+        printf("  [%lu] %s\n", (unsigned long)i, gf->tensors[i].name.data);
+    }
+    if (gf->n_tensors > 30) printf("  ... (%lu more)\n", (unsigned long)(gf->n_tensors - 30));
     printf("═══════════════════\n\n");
 }

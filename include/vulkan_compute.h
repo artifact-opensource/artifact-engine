@@ -201,6 +201,97 @@ void vk_gqa_attention(vk_context* ctx,
                       uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
                       uint32_t seq_len, uint32_t max_seq, uint32_t current_pos);
 
+/* ─── DeltaNet Operations ─── */
+
+/* 1D causal convolution: out[i] = sum(w[j] * x[i-j]) for j=0..kernel-1
+ * conv_state: ring buffer of (kernel_size-1) previous inputs [channels * (kernel-1)]
+ * x: current input [channels]
+ * weight: conv kernel [kernel_size * channels] (depthwise)
+ * out: result [channels]
+ * Updates conv_state in-place. */
+void vk_conv1d(vk_context* ctx,
+               gpu_buffer* conv_state, const gpu_buffer* x,
+               const gpu_buffer* weight, gpu_buffer* out,
+               uint32_t channels, uint32_t kernel_size);
+
+/* L2 normalization: out = x / ||x||_2 (per group)
+ * x: [total_dim], group_size elements per group, total_dim/group_size groups */
+void vk_l2_norm(vk_context* ctx,
+                const gpu_buffer* x, gpu_buffer* out,
+                uint32_t total_dim, uint32_t group_size);
+
+/* Sigmoid: out = 1 / (1 + exp(-x)), in-place */
+void vk_sigmoid(vk_context* ctx, gpu_buffer* x, uint32_t n_elements);
+
+/* Softplus: out = log(1 + exp(x)), in-place */
+void vk_softplus(vk_context* ctx, gpu_buffer* x, uint32_t n_elements);
+
+/* DeltaNet recurrent step (single token):
+ * Given Q [num_v_heads, head_k_dim], K [num_v_heads, head_k_dim], V [num_v_heads, head_v_dim],
+ * beta [num_v_heads] (decay from sigmoid(ssm_a)),
+ * S_prev [num_v_heads, head_v_dim, head_k_dim] (state matrix),
+ * computes:
+ *   S_new = beta * S_prev + V^T @ K  (per head)
+ *   out = S_new @ Q  (per head), shaped [num_v_heads * head_v_dim]
+ * Updates S in-place. */
+void vk_deltanet_step(vk_context* ctx,
+                      const gpu_buffer* q, const gpu_buffer* k,
+                      const gpu_buffer* v, const gpu_buffer* beta,
+                      gpu_buffer* state, gpu_buffer* out,
+                      uint32_t num_v_heads, uint32_t head_k_dim,
+                      uint32_t head_v_dim);
+
+/* RMS normalization per-head (for DeltaNet ssm_norm)
+ * x: [num_heads * head_dim], applies norm within each head_dim chunk
+ * weight: [head_dim] (shared across heads) */
+void vk_rmsnorm_head(vk_context* ctx,
+                     const gpu_buffer* x, const gpu_buffer* weight,
+                     gpu_buffer* out,
+                     uint32_t num_heads, uint32_t head_dim, float eps);
+
+/* ─── Mamba Operations ─── */
+
+/* Mamba-1 selective scan step (single token, autoregressive).
+ * Implements: s[i] = s[i] * exp(dt * A[i]) + B * (x * dt)
+ *             y = sum_i(s[i] * C[i]) + D * x
+ *
+ * x:     [d_inner] — input (after conv + silu)
+ * dt:    [d_inner] — time step (after softplus)
+ * A:     [d_state, d_inner] — diagonal decay (negative, stored as log)
+ * B:     [d_state] — input projection
+ * C:     [d_state] — output projection
+ * D:     [d_inner] — skip connection
+ * state: [d_inner * d_state] — recurrent state (updated in-place)
+ * y:     [d_inner] — output */
+void vk_mamba1_ssm_step(vk_context* ctx,
+                        const gpu_buffer* x, const gpu_buffer* dt,
+                        const gpu_buffer* A, const gpu_buffer* B,
+                        const gpu_buffer* C, const gpu_buffer* D,
+                        gpu_buffer* state, gpu_buffer* y,
+                        uint32_t d_inner, uint32_t d_state);
+
+/* Mamba-2 selective scan step (single token, autoregressive).
+ * Mamba-2 uses scalar decay per head (not per element like Mamba-1).
+ *
+ * x:     [n_head * dim_per_head] — input (d_inner = n_head * dim)
+ * dt:    [n_head] — time step per head (after softplus)
+ * A:     [n_head] — scalar decay per head (stored as -exp(A_log))
+ * B:     [n_group * d_state] — input projection (groups shared across heads)
+ * C:     [n_group * d_state] — output projection
+ * D:     [n_head] — skip connection per head
+ * state: [n_head * dim * d_state] — recurrent state (updated in-place)
+ * y:     [n_head * dim] — output (d_inner) */
+void vk_mamba2_ssm_step(vk_context* ctx,
+                        const gpu_buffer* x, const gpu_buffer* dt,
+                        const gpu_buffer* A, const gpu_buffer* B,
+                        const gpu_buffer* C, const gpu_buffer* D,
+                        gpu_buffer* state, gpu_buffer* y,
+                        uint32_t n_head, uint32_t dim_per_head,
+                        uint32_t d_state, uint32_t n_group);
+
+/* Bias addition: x[i] += bias[i], in-place */
+void vk_add_bias(vk_context* ctx, gpu_buffer* x, const gpu_buffer* bias, uint32_t n);
+
 /* ─── Diagnostics ─── */
 
 /* Print GPU info */

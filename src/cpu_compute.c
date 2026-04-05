@@ -6,6 +6,8 @@
  * Used for platforms without Vulkan (Xbox UWP, embedded).
  *
  * Compile with -DCPU_ONLY to exclude Vulkan entirely.
+ *
+ * Includes DeltaNet and Mamba operations for hybrid architecture support.
  */
 
 #ifdef CPU_ONLY
@@ -139,7 +141,9 @@ static void dequant_q4_k_block(const uint8_t* block, float* out, int n) {
     }
 }
 
-/* ───── High-Level Operations (matching vulkan_compute.h signatures exactly) ───── */
+/* ════════════════════════════════════════════════════════════════════
+ * HIGH-LEVEL OPERATIONS — matching vulkan_compute.h signatures
+ * ════════════════════════════════════════════════════════════════════ */
 
 void vk_matmul(vk_context* ctx,
                const gpu_buffer* A, const gpu_buffer* B, gpu_buffer* C,
@@ -318,7 +322,7 @@ void vk_gqa_attention(vk_context* ctx,
                       uint32_t head_dim, uint32_t n_heads, uint32_t n_kv_heads,
                       uint32_t seq_len, uint32_t max_seq, uint32_t current_pos) {
     (void)ctx;
-    (void)attn_scores;  /* we use our own local buffer */
+    (void)attn_scores;
     (void)max_seq;
     
     const float* qd = (const float*)q->mapped;
@@ -363,6 +367,284 @@ void vk_gqa_attention(vk_context* ctx,
     }
     
     free(scores);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * DELTANET OPERATIONS — for hybrid architecture
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* 1D causal convolution with ring buffer state (depthwise, single step). */
+void vk_conv1d(vk_context* ctx,
+               gpu_buffer* conv_state, const gpu_buffer* x,
+               const gpu_buffer* weight, gpu_buffer* out,
+               uint32_t channels, uint32_t kernel_size) {
+    (void)ctx;
+    float* state = (float*)conv_state->mapped;
+    const float* xd = (const float*)x->mapped;
+    const float* wd = (const float*)weight->mapped;
+    float* od = (float*)out->mapped;
+    
+    uint32_t hist = kernel_size - 1;
+    
+    for (uint32_t c = 0; c < channels; c++) {
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < hist; j++) {
+            sum += wd[j * channels + c] * state[j * channels + c];
+        }
+        sum += wd[hist * channels + c] * xd[c];
+        od[c] = sum;
+    }
+    
+    if (hist > 1) {
+        memmove(state, state + channels, (size_t)(hist - 1) * channels * sizeof(float));
+    }
+    if (hist > 0) {
+        memcpy(state + (hist - 1) * channels, xd, channels * sizeof(float));
+    }
+}
+
+/* L2 normalization per group */
+void vk_l2_norm(vk_context* ctx,
+                const gpu_buffer* x, gpu_buffer* out,
+                uint32_t total_dim, uint32_t group_size) {
+    (void)ctx;
+    const float* xd = (const float*)x->mapped;
+    float* od = (float*)out->mapped;
+    uint32_t num_groups = total_dim / group_size;
+    
+    for (uint32_t g = 0; g < num_groups; g++) {
+        uint32_t base = g * group_size;
+        float norm_sq = 0.0f;
+        for (uint32_t i = 0; i < group_size; i++) {
+            norm_sq += xd[base + i] * xd[base + i];
+        }
+        float inv_norm = 1.0f / (sqrtf(norm_sq) + 1e-12f);
+        for (uint32_t i = 0; i < group_size; i++) {
+            od[base + i] = xd[base + i] * inv_norm;
+        }
+    }
+}
+
+/* Sigmoid: x = 1 / (1 + exp(-x)), in-place */
+void vk_sigmoid(vk_context* ctx, gpu_buffer* x, uint32_t n_elements) {
+    (void)ctx;
+    float* xd = (float*)x->mapped;
+    for (uint32_t i = 0; i < n_elements; i++) {
+        xd[i] = 1.0f / (1.0f + expf(-xd[i]));
+    }
+}
+
+/* Softplus: x = log(1 + exp(x)), in-place */
+void vk_softplus(vk_context* ctx, gpu_buffer* x, uint32_t n_elements) {
+    (void)ctx;
+    float* xd = (float*)x->mapped;
+    for (uint32_t i = 0; i < n_elements; i++) {
+        if (xd[i] > 20.0f) {
+            /* xd[i] stays as is */
+        } else if (xd[i] < -20.0f) {
+            xd[i] = 0.0f;
+        } else {
+            xd[i] = logf(1.0f + expf(xd[i]));
+        }
+    }
+}
+
+/* DeltaNet recurrent step (single token, all heads). */
+void vk_deltanet_step(vk_context* ctx,
+                      const gpu_buffer* q, const gpu_buffer* k,
+                      const gpu_buffer* v, const gpu_buffer* beta,
+                      gpu_buffer* state, gpu_buffer* out,
+                      uint32_t num_v_heads, uint32_t head_k_dim,
+                      uint32_t head_v_dim) {
+    (void)ctx;
+    
+    const float* q_data = (const float*)q->mapped;
+    
+    uint32_t qkv_total = (uint32_t)(q->size / sizeof(float));
+    uint32_t v_in_qkv = num_v_heads * head_v_dim;
+    uint32_t qk_floats = qkv_total - v_in_qkv;
+    uint32_t num_k_heads = qk_floats / (head_k_dim * 2);
+    uint32_t k_offset = num_k_heads * head_k_dim;
+    
+    uint32_t q_offset = 0;
+    const float* k_data = q_data + k_offset;
+    const float* v_data = (const float*)v->mapped;
+    const float* ssm_a_data = (const float*)beta->mapped;
+    float* S = (float*)state->mapped;
+    float* od = (float*)out->mapped;
+    
+    uint32_t kv_group = (num_k_heads > 0) ? (num_v_heads / num_k_heads) : 1;
+    if (kv_group == 0) kv_group = 1;
+    
+    for (uint32_t vh = 0; vh < num_v_heads; vh++) {
+        uint32_t kh = vh / kv_group;
+        
+        const float* q_h = q_data + q_offset + kh * head_k_dim;
+        const float* k_h = k_data + kh * head_k_dim;
+        const float* v_h = v_data + vh * head_v_dim;
+        
+        float a_val = ssm_a_data[vh];
+        float sp = (a_val > 20.0f) ? a_val : ((a_val < -20.0f) ? 0.0f : logf(1.0f + expf(a_val)));
+        float decay = 1.0f / (1.0f + expf(sp));
+        
+        float* S_h = S + (size_t)vh * head_v_dim * head_k_dim;
+        
+        for (uint32_t vi = 0; vi < head_v_dim; vi++) {
+            for (uint32_t ki = 0; ki < head_k_dim; ki++) {
+                S_h[vi * head_k_dim + ki] = decay * S_h[vi * head_k_dim + ki]
+                                           + v_h[vi] * k_h[ki];
+            }
+        }
+        
+        float* o_h = od + vh * head_v_dim;
+        for (uint32_t vi = 0; vi < head_v_dim; vi++) {
+            float sum = 0.0f;
+            for (uint32_t ki = 0; ki < head_k_dim; ki++) {
+                sum += S_h[vi * head_k_dim + ki] * q_h[ki];
+            }
+            o_h[vi] = sum;
+        }
+    }
+}
+
+/* RMS normalization per-head */
+void vk_rmsnorm_head(vk_context* ctx,
+                     const gpu_buffer* x, const gpu_buffer* weight,
+                     gpu_buffer* out,
+                     uint32_t num_heads, uint32_t head_dim, float eps) {
+    (void)ctx;
+    const float* xd = (const float*)x->mapped;
+    const float* wd = (const float*)weight->mapped;
+    float* od = (float*)out->mapped;
+    
+    for (uint32_t h = 0; h < num_heads; h++) {
+        uint32_t base = h * head_dim;
+        float ss = 0.0f;
+        for (uint32_t i = 0; i < head_dim; i++) {
+            ss += xd[base + i] * xd[base + i];
+        }
+        float rms = 1.0f / sqrtf(ss / head_dim + eps);
+        for (uint32_t i = 0; i < head_dim; i++) {
+            od[base + i] = xd[base + i] * rms * wd[i];
+        }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * MAMBA OPERATIONS — S6 (Mamba-1) and SSD (Mamba-2)
+ * ════════════════════════════════════════════════════════════════════ */
+
+/* Mamba-1 selective scan step (single token, autoregressive).
+ * Implements: s[j,i] = s[j,i] * exp(dt[i] * A[j,i]) + B[j] * (x[i] * dt[i])
+ *             y[i]   = sum_j(s[j,i] * C[j]) + D[i] * x[i]
+ *
+ * x:     [d_inner] — input (after conv + silu)
+ * dt:    [d_inner] — time step (after softplus)
+ * A:     [d_state, d_inner] — diagonal decay (negative, stored as log)
+ * B:     [d_state] — input projection
+ * C:     [d_state] — output projection
+ * D:     [d_inner] — skip connection
+ * state: [d_state * d_inner] — recurrent state (updated in-place)
+ * y:     [d_inner] — output
+ */
+void vk_mamba1_ssm_step(vk_context* ctx,
+                        const gpu_buffer* x, const gpu_buffer* dt_buf,
+                        const gpu_buffer* A, const gpu_buffer* B_buf,
+                        const gpu_buffer* C_buf, const gpu_buffer* D_buf,
+                        gpu_buffer* state, gpu_buffer* y,
+                        uint32_t d_inner, uint32_t d_state) {
+    (void)ctx;
+    const float* xd = (const float*)x->mapped;
+    const float* dt = (const float*)dt_buf->mapped;
+    const float* Ad = (const float*)A->mapped;
+    const float* Bd = (const float*)B_buf->mapped;
+    const float* Cd = (const float*)C_buf->mapped;
+    const float* Dd = (const float*)D_buf->mapped;
+    float* sd = (float*)state->mapped;
+    float* yd = (float*)y->mapped;
+    
+    for (uint32_t i = 0; i < d_inner; i++) {
+        float yi = 0.0f;
+        float dt_i = dt[i];
+        float x_dt = xd[i] * dt_i;
+        
+        for (uint32_t j = 0; j < d_state; j++) {
+            uint32_t si = j * d_inner + i;  /* state[d_state, d_inner] */
+            /* dA = exp(dt * A), where A is stored as negative values */
+            float dA = expf(dt_i * Ad[j * d_inner + i]);
+            /* state update */
+            sd[si] = sd[si] * dA + Bd[j] * x_dt;
+            /* output accumulation */
+            yi += sd[si] * Cd[j];
+        }
+        
+        /* Skip connection: y = y + D * x */
+        yd[i] = yi + Dd[i] * xd[i];
+    }
+}
+
+/* Mamba-2 selective scan step (single token, autoregressive).
+ * Mamba-2 uses scalar decay per head (not per element like Mamba-1).
+ *
+ * x:     [n_head * dim_per_head] — input (d_inner = n_head * dim)
+ * dt:    [n_head] — time step per head (after softplus)
+ * A:     [n_head] — scalar decay per head (stored as -exp(A_log))
+ * B:     [n_group * d_state] — input projection (groups shared across heads)
+ * C:     [n_group * d_state] — output projection
+ * D:     [n_head] — skip connection per head
+ * state: [n_head * dim_per_head * d_state] — recurrent state (updated in-place)
+ * y:     [n_head * dim_per_head] — output (d_inner)
+ */
+void vk_mamba2_ssm_step(vk_context* ctx,
+                        const gpu_buffer* x, const gpu_buffer* dt_buf,
+                        const gpu_buffer* A, const gpu_buffer* B_buf,
+                        const gpu_buffer* C_buf, const gpu_buffer* D_buf,
+                        gpu_buffer* state, gpu_buffer* y,
+                        uint32_t n_head, uint32_t dim_per_head,
+                        uint32_t d_state, uint32_t n_group) {
+    (void)ctx;
+    const float* xd = (const float*)x->mapped;
+    const float* dt = (const float*)dt_buf->mapped;
+    const float* Ad = (const float*)A->mapped;
+    const float* Bd = (const float*)B_buf->mapped;
+    const float* Cd = (const float*)C_buf->mapped;
+    const float* Dd = (const float*)D_buf->mapped;
+    float* sd = (float*)state->mapped;
+    float* yd = (float*)y->mapped;
+    
+    uint32_t heads_per_group = (n_group > 0) ? (n_head / n_group) : n_head;
+    
+    for (uint32_t h = 0; h < n_head; h++) {
+        float dt_sp = dt[h];  /* already softplus'd */
+        float dA = expf(dt_sp * Ad[h]);
+        uint32_t g = h / heads_per_group;  /* which group this head belongs to */
+        
+        for (uint32_t d = 0; d < dim_per_head; d++) {
+            uint32_t xidx = h * dim_per_head + d;
+            float x_dt = xd[xidx] * dt_sp;
+            float yi = 0.0f;
+            
+            for (uint32_t s = 0; s < d_state; s++) {
+                uint32_t si = (h * dim_per_head + d) * d_state + s;
+                /* state update: s = dA * s + B * x_dt */
+                sd[si] = sd[si] * dA + Bd[g * d_state + s] * x_dt;
+                /* output: y += s * C */
+                yi += sd[si] * Cd[g * d_state + s];
+            }
+            
+            /* Skip connection: y += D * x */
+            yd[xidx] = yi + Dd[h] * xd[xidx];
+        }
+    }
+}
+
+/* Add bias to buffer, in-place: x[i] += bias[i] */
+void vk_add_bias(vk_context* ctx, gpu_buffer* x, const gpu_buffer* bias, uint32_t n) {
+    (void)ctx;
+    float* xd = (float*)x->mapped;
+    const float* bd = (const float*)bias->mapped;
+    for (uint32_t i = 0; i < n; i++)
+        xd[i] += bd[i];
 }
 
 /* ─── Diagnostics ─── */

@@ -25,6 +25,8 @@
 
 #ifdef _WIN32
   #include <windows.h>
+#else
+  #include <unistd.h>
 #endif
 
 #define VERSION "0.5.0"
@@ -108,23 +110,43 @@ int engine_main(int argc, char** argv);
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    /* Redirect stdout/stderr to a log file for debugging on Xbox */
-    const char* appdata = getenv("LOCALAPPDATA");
-    if (appdata) {
-        char logpath[512];
-        snprintf(logpath, sizeof(logpath), "%s\\..\\LocalState\\engine.log", appdata);
-        FILE* lf = fopen(logpath, "w");
-        if (lf) { fclose(lf); freopen(logpath, "w", stdout); freopen(logpath, "a", stderr); }
+    /* Detect if running in a console (SSH/cmd) vs headless (APPX/UWP) */
+    BOOL has_console = (GetConsoleWindow() != NULL) || (GetStdHandle(STD_OUTPUT_HANDLE) != INVALID_HANDLE_VALUE && GetStdHandle(STD_OUTPUT_HANDLE) != NULL);
+    
+    /* Check for --console flag to force console mode */
+    int console_arg = -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--console") == 0) { has_console = TRUE; console_arg = i; break; }
     }
     
-    /* Start engine in a background thread */
-    g_argc = argc;
-    g_argv = argv;
-    CreateThread(NULL, 0, engine_thread, NULL, 0, NULL);
+    /* Strip --console from argv so engine_main doesn't see it */
+    if (console_arg >= 0) {
+        for (int i = console_arg; i < argc - 1; i++) argv[i] = argv[i + 1];
+        argc--;
+    }
     
-    /* Run message pump on main thread (keeps Xbox from killing us) */
-    run_message_pump();
-    return 0;
+    if (!has_console) {
+        /* APPX/UWP mode: redirect stdout to log, use message pump */
+        const char* appdata = getenv("LOCALAPPDATA");
+        if (appdata) {
+            char logpath[512];
+            snprintf(logpath, sizeof(logpath), "%s\\..\\LocalState\\engine.log", appdata);
+            FILE* lf = fopen(logpath, "w");
+            if (lf) { fclose(lf); freopen(logpath, "w", stdout); freopen(logpath, "a", stderr); }
+        }
+        
+        /* Start engine in a background thread */
+        g_argc = argc;
+        g_argv = argv;
+        CreateThread(NULL, 0, engine_thread, NULL, 0, NULL);
+        
+        /* Run message pump on main thread (keeps Xbox from killing us) */
+        run_message_pump();
+        return 0;
+    } else {
+        /* Console mode: run engine directly on main thread (SSH, cmd, etc) */
+        return engine_main(argc, argv);
+    }
 #else
     return engine_main(argc, argv);
 #endif
