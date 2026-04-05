@@ -65,7 +65,7 @@ Three new modules for the AI companion architecture:
 
 **Date:** 2026-04-02
 
-First release. GPU-accelerated LLM inference from scratch.
+First release. GPU-accelerated LLM inference engine.
 
 - **GGUF parser** — `src/gguf.c` (479 lines). Parses GGUF v2/v3 headers, metadata, tensor descriptors, and weight data.
 - **Vulkan compute backend** — `src/vulkan_compute.c` (698 lines). 8 SPIR-V compute shaders: matmul, softmax, RMSNorm, RoPE, SiLU, add, mul, embed.

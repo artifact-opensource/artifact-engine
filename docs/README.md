@@ -1,6 +1,6 @@
 # Documentation
 
-Artifact Engine — LLM inference from scratch. Vulkan compute. Pure C. Zero dependencies.
+Artifact Engine — GPU-accelerated LLM inference. Vulkan compute. Pure C. Zero dependencies.
 
 ## Contents
 

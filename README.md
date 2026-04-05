@@ -5,7 +5,7 @@
 <h1 align="center">Artifact Engine</h1>
 
 <p align="center">
-  <strong>LLM inference from scratch. Vulkan compute. Pure C. Zero dependencies.</strong>
+  <strong>GPU-accelerated LLM inference. Vulkan compute. Pure C. Zero dependencies.</strong>
 </p>
 
 <p align="center">

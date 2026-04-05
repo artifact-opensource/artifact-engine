@@ -4,7 +4,7 @@ The BPE (Byte-Pair Encoding) tokenizer implementation in Artifact Engine. Covers
 
 ## Overview
 
-Artifact Engine implements a full BPE tokenizer from scratch in `src/tokenizer.c`. No external tokenizer libraries (SentencePiece, tiktoken, HuggingFace Tokenizers) are used. The tokenizer loads its vocabulary and merge rules directly from GGUF metadata, making it self-contained — the model file is the only input needed.
+Artifact Engine implements a full BPE tokenizer in `src/tokenizer.c`. No external tokenizer libraries (SentencePiece, tiktoken, HuggingFace Tokenizers) are used. The tokenizer loads its vocabulary and merge rules directly from GGUF metadata, making it self-contained — the model file is the only input needed.
 
 ## Vocabulary
 

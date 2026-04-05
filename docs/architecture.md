@@ -4,7 +4,7 @@ This document describes the internal architecture of Artifact Engine — how dat
 
 ## Design Principles
 
-1. **Zero dependencies.** No external libraries. The Vulkan headers are vendored. Everything else is implemented from scratch.
+1. **Zero dependencies.** No external libraries. The Vulkan headers are vendored. Everything else is implemented internally.
 2. **Single binary.** One executable, under 250KB compiled. No shared libraries, no runtime requirements beyond a GPU driver (or nothing at all for the CPU backend).
 3. **Layered abstraction.** Each component (GGUF parser, tokenizer, compute backend, HTTP server) is isolated behind a clean C interface. Backends are swappable at startup.
 4. **Minimal allocation.** Large buffers (model weights, KV cache, activations) are allocated once at model load time. Inference runs with zero heap allocation in the hot path.
