@@ -8,7 +8,7 @@ REM  Builds v0.5.0 with all modules (CPU compute backend)
 REM  Usage: build_xbox.bat [--package] [--deploy]
 REM ═══════════════════════════════════════════════════════════
 
-set VERSION=0.5.0
+set VERSION=0.7.0
 
 REM ── MSVC Build Tools 2022 ──
 set "MSVC=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207"
@@ -123,9 +123,7 @@ echo  [4/4] Deploying to Xbox (192.168.1.11)...
 
 REM Uninstall old version first
 curl -sk -u artifact:sirius -X DELETE -H "Content-Length: 0" ^
-    "https://192.168.1.11:11443/api/app/packagemanager/package?package=ArtifactVirtual.ArtifactEngine_0.3.0.0_x64__40mv32fwdcjmj" >nul 2>&1
-curl -sk -u artifact:sirius -X DELETE -H "Content-Length: 0" ^
-    "https://192.168.1.11:11443/api/app/packagemanager/package?package=ArtifactVirtual.ArtifactEngine_0.4.0.0_x64__40mv32fwdcjmj" >nul 2>&1
+    "https://192.168.1.11:11443/api/app/packagemanager/package?package=ArtifactVirtual.ArtifactEngine_0.6.0.0_x64__40mv32fwdcjmj" >nul 2>&1
 
 timeout /t 2 >nul
 

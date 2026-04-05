@@ -46,8 +46,11 @@ bool vk_alloc_device(vk_context* ctx, gpu_buffer* buf, size_t size) {
     }
     memset(buf->mapped, 0, size);
     buf->size = size;
-    buf->buffer = NULL;
+    buf->buffer = (void*)0x1;  /* sentinel: "owned by us, free on cleanup" */
     buf->memory = NULL;
+    buf->dtype = 0;   /* default F32 */
+    buf->n_rows = 0;
+    buf->n_cols = 0;
     ctx->used_memory += size;
     return true;
 }
@@ -71,11 +74,13 @@ bool vk_download(vk_context* ctx, void* dst, const gpu_buffer* src, size_t size)
 }
 
 void vk_free_buffer(vk_context* ctx, gpu_buffer* buf) {
-    if (buf->mapped) {
+    if (buf->mapped && buf->buffer == (void*)0x1) {
+        /* Only free buffers we allocated (not mmap'd pointers) */
         ctx->used_memory -= buf->size;
         free(buf->mapped);
-        buf->mapped = NULL;
     }
+    buf->mapped = NULL;
+    buf->buffer = NULL;
     buf->size = 0;
 }
 
@@ -191,6 +196,357 @@ void vk_matmul_q4k(vk_context* ctx,
         }
     }
     free(a_row);
+}
+
+/* ───── Q3_K Dequantization ───── */
+/* Q3_K block: 256 elements, 110 bytes
+ * Layout: [2B hmask] [32B qs (2-bit)] [64B signs/hmask] [12B scales] [2B d_fp16]
+ * Actually: struct { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; uint16_t d; }
+ * hmask = high bit mask, qs = low 2 bits, scales = 4-bit sub-block scales
+ * Total per block = 32 + 64 + 12 + 2 = 110 bytes */
+
+static void dequant_q3_k_block(const uint8_t* block, float* out, int n) {
+    /* Q3_K layout (110 bytes for 256 elements):
+     * Bytes 0..31:   hmask[32]  — high bit for each element
+     * Bytes 32..95:  qs[64]     — packed 2-bit quantized values (2 per byte = 128 pairs → 256)
+     * Bytes 96..107: scales[12] — sub-block scales (packed 6-bit)
+     * Bytes 108..109: d (fp16)  — overall scale factor
+     */
+    const uint8_t* hmask  = block;           /* 32 bytes */
+    const uint8_t* qs     = block + 32;      /* 64 bytes */
+    const uint8_t* sc_raw = block + 96;      /* 12 bytes */
+    uint16_t d_h;
+    memcpy(&d_h, block + 108, 2);
+    float d = fp16_to_fp32(d_h);
+
+    /* Decode 6-bit scales for 8 sub-blocks */
+    int8_t scales[8];
+    for (int i = 0; i < 8; i++) {
+        uint8_t s;
+        if (i < 4) {
+            /* Lower 4 sub-blocks: 6 bits from scales[i] (low) + scales[i+8] bits */
+            s = sc_raw[i] & 0x3f;
+        } else {
+            /* Upper 4 sub-blocks: rearranged from remaining bytes */
+            s = ((sc_raw[i + 4] & 0xF0) >> 4) | ((sc_raw[i - 4] >> 6) << 4);
+        }
+        scales[i] = (int8_t)(s - 32);  /* scales are stored offset by 32 */
+    }
+
+    for (int sb = 0; sb < 8 && sb * 32 < n; sb++) {
+        float block_d = d * scales[sb];
+        for (int j = 0; j < 32 && sb * 32 + j < n; j++) {
+            int idx = sb * 32 + j;
+            /* Extract 2-bit value from qs */
+            int byte_idx = idx / 4;
+            int bit_shift = (idx % 4) * 2;
+            uint8_t q2 = (qs[byte_idx] >> bit_shift) & 0x03;
+            /* Extract high bit from hmask */
+            int hm_byte = idx / 8;
+            int hm_bit  = idx % 8;
+            uint8_t hbit = (hmask[hm_byte] >> hm_bit) & 1;
+            /* Combine: 3-bit value = q2 | (hbit << 2), range 0..7, centered at 4 */
+            int q3 = (int)q2 | ((int)hbit << 2);
+            out[idx] = block_d * (q3 - 4);
+        }
+    }
+}
+
+/* ───── Q6_K Dequantization ───── */
+/* Q6_K: 256 elements, 210 bytes
+ * Layout: uint8_t ql[128] (low 4 bits), uint8_t qh[64] (high 2 bits),
+ *         int8_t scales[16], uint16_t d */
+
+static void dequant_q6_k_block(const uint8_t* block, float* out, int n) {
+    const uint8_t* ql = block;          /* 128 bytes — low 4 bits */
+    const uint8_t* qh = block + 128;    /* 64 bytes — high 2 bits */
+    const int8_t*  sc = (const int8_t*)(block + 192);  /* 16 bytes — scales */
+    uint16_t d_h;
+    memcpy(&d_h, block + 208, 2);
+    float d = fp16_to_fp32(d_h);
+
+    for (int sb = 0; sb < 16 && sb * 16 < n; sb++) {
+        float block_d = d * sc[sb];
+        for (int j = 0; j < 16 && sb * 16 + j < n; j++) {
+            int idx = sb * 16 + j;
+            /* Low 4 bits from ql */
+            uint8_t lo;
+            if (idx < 128) {
+                lo = (idx % 2 == 0) ? (ql[idx / 2] & 0x0F) : ((ql[idx / 2] >> 4) & 0x0F);
+            } else {
+                int qi = idx - 128;
+                lo = (qi % 2 == 0) ? (ql[64 + qi / 2] & 0x0F) : ((ql[64 + qi / 2] >> 4) & 0x0F);
+            }
+            /* High 2 bits from qh */
+            int qh_idx = idx / 4;
+            int qh_shift = (idx % 4) * 2;
+            uint8_t hi = (qh[qh_idx] >> qh_shift) & 0x03;
+            /* 6-bit value = lo | (hi << 4), range 0..63, centered at 32 */
+            int q6 = (int)lo | ((int)hi << 4);
+            out[idx] = block_d * (q6 - 32);
+        }
+    }
+}
+
+/* ───── Q5_K Dequantization ───── */
+/* Q5_K: 256 elements, 176 bytes
+ * Layout: fp16 d, fp16 dmin, uint8_t scales[12], uint8_t qh[32], uint8_t qs[128]
+ * Similar to Q4_K but with an extra high bit per element */
+
+static void dequant_q5_k_block(const uint8_t* block, float* out, int n) {
+    uint16_t d_h, dmin_h;
+    memcpy(&d_h, block, 2);
+    memcpy(&dmin_h, block + 2, 2);
+    float d = fp16_to_fp32(d_h);
+    float dmin = fp16_to_fp32(dmin_h);
+    const uint8_t* scales = block + 4;  /* 12 bytes */
+    const uint8_t* qh = block + 16;     /* 32 bytes — high bits */
+    const uint8_t* qs = block + 48;     /* 128 bytes — low 4 bits */
+
+    for (int sb = 0; sb < 8 && sb * 32 < n; sb++) {
+        uint8_t sc, m;
+        if (sb < 4) {
+            sc = scales[sb] & 0x3f;
+            m  = scales[sb + 4] & 0x3f;
+        } else {
+            sc = ((scales[sb + 4] & 0xF0) >> 4) | ((scales[sb - 4] >> 6) << 4);
+            m  = ((scales[sb + 4] & 0x0F))       | ((scales[sb]     >> 6) << 4);
+        }
+        float block_d = d * sc;
+        float block_m = dmin * m;
+        for (int j = 0; j < 32 && sb * 32 + j < n; j++) {
+            int idx = sb * 32 + j;
+            /* Low 4 bits from qs */
+            int byte_idx = idx / 2;
+            uint8_t q4 = (idx % 2 == 0) ? (qs[byte_idx] & 0x0F) : ((qs[byte_idx] >> 4) & 0x0F);
+            /* High bit from qh */
+            int qh_byte = idx / 8;
+            int qh_bit  = idx % 8;
+            uint8_t hbit = (qh[qh_byte] >> qh_bit) & 1;
+            /* 5-bit value = q4 | (hbit << 4) */
+            int q5 = (int)q4 | ((int)hbit << 4);
+            out[idx] = block_d * q5 - block_m;
+        }
+    }
+}
+
+/* ───── Q8_0 Dequantization ───── */
+/* Q8_0: 32 elements, 34 bytes: fp16 d + 32 x int8 */
+
+static void dequant_q8_0_block(const uint8_t* block, float* out, int n) {
+    uint16_t d_h;
+    memcpy(&d_h, block, 2);
+    float d = fp16_to_fp32(d_h);
+    const int8_t* qs = (const int8_t*)(block + 2);
+    for (int i = 0; i < n && i < 32; i++) {
+        out[i] = d * qs[i];
+    }
+}
+
+/* ───── Generic quantized matmul helper ───── */
+/* W[M rows × K cols] is quantized, input[1 × K] is fp32, out[1 × M] is fp32 
+ * Note: for weight matrices, the GGUF stores them as [out_features, in_features]
+ * So M = out_features (rows of weight = N in matmul notation), K = in_features */
+
+typedef void (*dequant_fn)(const uint8_t* block, float* out, int n);
+
+static void matmul_quantized(const uint8_t* w_data, const float* input, float* output,
+                             uint32_t M, uint32_t N, uint32_t K,
+                             size_t bytes_per_block, size_t elems_per_block,
+                             dequant_fn dequant) {
+    float* w_row = (float*)malloc(K * sizeof(float));
+    if (!w_row) return;
+    
+    size_t blocks_per_row = (K + elems_per_block - 1) / elems_per_block;
+    size_t row_bytes = blocks_per_row * bytes_per_block;
+    
+    for (uint32_t i = 0; i < N; i++) {  /* N = out_features = rows of weight matrix */
+        const uint8_t* row_data = w_data + i * row_bytes;
+        for (size_t blk = 0; blk < blocks_per_row; blk++) {
+            int remaining = (int)(K - blk * elems_per_block);
+            if (remaining > (int)elems_per_block) remaining = (int)elems_per_block;
+            dequant(row_data + blk * bytes_per_block,
+                    w_row + blk * elems_per_block, remaining);
+        }
+        for (uint32_t j = 0; j < M; j++) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < K; k++) sum += input[j * K + k] * w_row[k];
+            output[j * N + i] = sum;
+        }
+    }
+    free(w_row);
+}
+
+void vk_matmul_q3k(vk_context* ctx,
+                    const gpu_buffer* W, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K) {
+    (void)ctx;
+    matmul_quantized((const uint8_t*)W->mapped, (const float*)B->mapped,
+                     (float*)C->mapped, M, N, K, 110, 256, dequant_q3_k_block);
+}
+
+void vk_matmul_q6k(vk_context* ctx,
+                    const gpu_buffer* W, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K) {
+    (void)ctx;
+    matmul_quantized((const uint8_t*)W->mapped, (const float*)B->mapped,
+                     (float*)C->mapped, M, N, K, 210, 256, dequant_q6_k_block);
+}
+
+void vk_matmul_q5k(vk_context* ctx,
+                    const gpu_buffer* W, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K) {
+    (void)ctx;
+    matmul_quantized((const uint8_t*)W->mapped, (const float*)B->mapped,
+                     (float*)C->mapped, M, N, K, 176, 256, dequant_q5_k_block);
+}
+
+void vk_matmul_q8_0(vk_context* ctx,
+                     const gpu_buffer* W, const gpu_buffer* B, gpu_buffer* C,
+                     uint32_t M, uint32_t N, uint32_t K) {
+    (void)ctx;
+    matmul_quantized((const uint8_t*)W->mapped, (const float*)B->mapped,
+                     (float*)C->mapped, M, N, K, 34, 32, dequant_q8_0_block);
+}
+
+void vk_matmul_f16(vk_context* ctx,
+                    const gpu_buffer* W, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K) {
+    (void)ctx;
+    /* Dequantize entire F16 weight row-by-row */
+    const uint16_t* w_data = (const uint16_t*)W->mapped;
+    const float* input = (const float*)B->mapped;
+    float* output = (float*)C->mapped;
+    float* w_row = (float*)malloc(K * sizeof(float));
+    if (!w_row) return;
+    
+    for (uint32_t i = 0; i < N; i++) {
+        for (uint32_t k = 0; k < K; k++) {
+            w_row[k] = fp16_to_fp32(w_data[i * K + k]);
+        }
+        for (uint32_t j = 0; j < M; j++) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < K; k++) sum += input[j * K + k] * w_row[k];
+            output[j * N + i] = sum;
+        }
+    }
+    free(w_row);
+}
+
+/* ───── Auto-dispatch matmul based on weight buffer dtype ───── */
+
+void vk_matmul_auto(vk_context* ctx,
+                    const gpu_buffer* input, const gpu_buffer* W, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K) {
+    switch (W->dtype) {
+        case 0:  /* GGML_TYPE_F32 */
+            vk_matmul(ctx, input, W, C, M, N, K);
+            break;
+        case 1:  /* GGML_TYPE_F16 */
+            vk_matmul_f16(ctx, W, input, C, M, N, K);
+            break;
+        case 11: /* GGML_TYPE_Q3_K */
+            vk_matmul_q3k(ctx, W, input, C, M, N, K);
+            break;
+        case 12: /* GGML_TYPE_Q4_K */
+            vk_matmul_q4k(ctx, W, input, C, M, N, K);
+            break;
+        case 13: /* GGML_TYPE_Q5_K */
+            vk_matmul_q5k(ctx, W, input, C, M, N, K);
+            break;
+        case 14: /* GGML_TYPE_Q6_K */
+            vk_matmul_q6k(ctx, W, input, C, M, N, K);
+            break;
+        case 8:  /* GGML_TYPE_Q8_0 */
+            vk_matmul_q8_0(ctx, W, input, C, M, N, K);
+            break;
+        default:
+            fprintf(stderr, "cpu: unsupported dtype %u for matmul — falling back to fp32\n", W->dtype);
+            vk_matmul(ctx, input, W, C, M, N, K);
+            break;
+    }
+}
+
+/* ───── Auto-dispatch embedding lookup ───── */
+
+void vk_embedding_auto(vk_context* ctx,
+                       const gpu_buffer* table, gpu_buffer* out,
+                       uint32_t token_id, uint32_t dim) {
+    (void)ctx;
+    float* od = (float*)out->mapped;
+    
+    switch (table->dtype) {
+        case 0: { /* F32 */
+            const float* td = (const float*)table->mapped;
+            memcpy(od, td + (size_t)token_id * dim, dim * sizeof(float));
+            break;
+        }
+        case 1: { /* F16 */
+            const uint16_t* td = (const uint16_t*)table->mapped;
+            const uint16_t* row = td + (size_t)token_id * dim;
+            for (uint32_t i = 0; i < dim; i++) od[i] = fp16_to_fp32(row[i]);
+            break;
+        }
+        case 11: { /* Q3_K */
+            size_t blocks_per_row = (dim + 255) / 256;
+            size_t row_bytes = blocks_per_row * 110;
+            const uint8_t* row = (const uint8_t*)table->mapped + (size_t)token_id * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                int rem = (int)(dim - blk * 256);
+                if (rem > 256) rem = 256;
+                dequant_q3_k_block(row + blk * 110, od + blk * 256, rem);
+            }
+            break;
+        }
+        case 12: { /* Q4_K */
+            size_t blocks_per_row = (dim + 255) / 256;
+            size_t row_bytes = blocks_per_row * 144;
+            const uint8_t* row = (const uint8_t*)table->mapped + (size_t)token_id * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                int rem = (int)(dim - blk * 256);
+                if (rem > 256) rem = 256;
+                dequant_q4_k_block(row + blk * 144, od + blk * 256, rem);
+            }
+            break;
+        }
+        case 14: { /* Q6_K */
+            size_t blocks_per_row = (dim + 255) / 256;
+            size_t row_bytes = blocks_per_row * 210;
+            const uint8_t* row = (const uint8_t*)table->mapped + (size_t)token_id * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                int rem = (int)(dim - blk * 256);
+                if (rem > 256) rem = 256;
+                dequant_q6_k_block(row + blk * 210, od + blk * 256, rem);
+            }
+            break;
+        }
+        case 13: { /* Q5_K */
+            size_t blocks_per_row = (dim + 255) / 256;
+            size_t row_bytes = blocks_per_row * 176;
+            const uint8_t* row = (const uint8_t*)table->mapped + (size_t)token_id * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                int rem = (int)(dim - blk * 256);
+                if (rem > 256) rem = 256;
+                dequant_q5_k_block(row + blk * 176, od + blk * 256, rem);
+            }
+            break;
+        }
+        case 8: { /* Q8_0 */
+            size_t blocks_per_row = (dim + 31) / 32;
+            size_t row_bytes = blocks_per_row * 34;
+            const uint8_t* row = (const uint8_t*)table->mapped + (size_t)token_id * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; blk++) {
+                int rem = (int)(dim - blk * 32);
+                if (rem > 32) rem = 32;
+                dequant_q8_0_block(row + blk * 34, od + blk * 32, rem);
+            }
+            break;
+        }
+        default:
+            fprintf(stderr, "cpu: unsupported embedding dtype %u — zero fill\n", table->dtype);
+            memset(od, 0, dim * sizeof(float));
+            break;
+    }
 }
 
 /* RMS normalization: out = x * rsqrt(mean(x^2) + eps) * weight */

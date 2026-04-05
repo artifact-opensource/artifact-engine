@@ -46,6 +46,12 @@ static bool upload_tensor(engine* eng, gpu_buffer* dst,
     
     const void* data = gguf_tensor_data(eng->gguf, ti);
     
+#ifdef CPU_ONLY
+    /* CPU mode: point directly to mmap'd GGUF data — zero-copy */
+    memset(dst, 0, sizeof(*dst));
+    dst->mapped = (void*)data;  /* const-cast: CPU ops read-only for weights */
+    dst->size = ti->n_bytes;
+#else
     if (!vk_alloc_device(&eng->vk, dst, ti->n_bytes)) {
         fprintf(stderr, "engine: failed to allocate GPU buffer for '%s' (%zu bytes)\n",
                 name, (size_t)ti->n_bytes);
@@ -56,6 +62,12 @@ static bool upload_tensor(engine* eng, gpu_buffer* dst,
         fprintf(stderr, "engine: failed to upload '%s' to GPU\n", name);
         return false;
     }
+#endif
+    
+    /* Store tensor type metadata for quantization-aware dispatch */
+    dst->dtype = (uint32_t)ti->type;
+    dst->n_rows = (ti->n_dims >= 2) ? (uint32_t)ti->dims[1] : 1;
+    dst->n_cols = (uint32_t)ti->dims[0];
     
     return true;
 }
@@ -221,7 +233,7 @@ bool engine_load_model(engine* eng, const char* model_path) {
             snprintf(name, sizeof(name), "blk.%u.ssm_a", l);
             if (!upload_tensor(eng, &layer->ssm_a, name, true)) return false;
             
-            snprintf(name, sizeof(name), "blk.%u.ssm_dt", l);
+            snprintf(name, sizeof(name), "blk.%u.ssm_dt.bias", l);
             if (!upload_tensor(eng, &layer->ssm_dt, name, true)) return false;
             
         } else if (layer->type == LAYER_MAMBA) {
@@ -515,11 +527,11 @@ static void forward_layer_attention(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 2. QKV projections */
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->wq,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->wq,
               &eng->scratch.q, 1, n_heads * hd, H);
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->wk,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->wk,
               &eng->scratch.k, 1, n_kv * hd, H);
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->wv,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->wv,
               &eng->scratch.v, 1, n_kv * hd, H);
     vk_barrier(&eng->vk);
     
@@ -559,7 +571,7 @@ static void forward_layer_attention(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 8. Output projection */
-    vk_matmul(&eng->vk, &eng->scratch.attn_out, &lw->wo,
+    vk_matmul_auto(&eng->vk, &eng->scratch.attn_out, &lw->wo,
               &eng->scratch.norm_out, 1, H, n_heads * hd);
     vk_barrier(&eng->vk);
     
@@ -576,9 +588,9 @@ static void forward_layer_attention(engine* eng, uint32_t layer, uint32_t pos) {
                    &eng->scratch.norm_out, H, eng->arch.rms_norm_eps);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
                   &eng->scratch.ffn_gate_out, 1, I, H);
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
                   &eng->scratch.ffn_up_out, 1, I, H);
         vk_barrier(&eng->vk);
         
@@ -589,7 +601,7 @@ static void forward_layer_attention(engine* eng, uint32_t layer, uint32_t pos) {
                 &eng->scratch.ffn_gate_out, I);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
+        vk_matmul_auto(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
                   &eng->scratch.ffn_down_out, 1, H, I);
         vk_barrier(&eng->vk);
         
@@ -625,12 +637,12 @@ static void forward_layer_deltanet(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 2. Fused QKV projection */
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->wqkv,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->wqkv,
               &eng->scratch.delta_qkv, 1, qkv_total, H);
     vk_barrier(&eng->vk);
     
     /* 3. Gate Z projection */
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->wqkv_gate,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->wqkv_gate,
               &eng->scratch.delta_gate, 1, d_inner, H);
     vk_barrier(&eng->vk);
     
@@ -679,7 +691,7 @@ static void forward_layer_deltanet(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 12. Output projection */
-    vk_matmul(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
+    vk_matmul_auto(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
               &eng->scratch.norm_out, 1, H, d_inner);
     vk_barrier(&eng->vk);
     
@@ -696,9 +708,9 @@ static void forward_layer_deltanet(engine* eng, uint32_t layer, uint32_t pos) {
                    &eng->scratch.norm_out, H, eng->arch.rms_norm_eps);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
                   &eng->scratch.ffn_gate_out, 1, I, H);
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
                   &eng->scratch.ffn_up_out, 1, I, H);
         vk_barrier(&eng->vk);
         
@@ -709,7 +721,7 @@ static void forward_layer_deltanet(engine* eng, uint32_t layer, uint32_t pos) {
                 &eng->scratch.ffn_gate_out, I);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
+        vk_matmul_auto(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
                   &eng->scratch.ffn_down_out, 1, H, I);
         vk_barrier(&eng->vk);
         
@@ -739,7 +751,7 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 2. ssm_in projection: hidden → [2*d_inner] (x and z) */
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ssm_in,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ssm_in,
               &eng->scratch.mamba_in, 1, 2 * d_inner, H);
     vk_barrier(&eng->vk);
     
@@ -769,7 +781,7 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 5. ssm_x projection: x → [dt_rank + 2*d_state] to get dt_raw, B, C */
-    vk_matmul(&eng->vk, &eng->scratch.mamba_y, &lw->ssm_x,
+    vk_matmul_auto(&eng->vk, &eng->scratch.mamba_y, &lw->ssm_x,
               &eng->scratch.mamba_x, 1, dt_rank + 2 * d_state, d_inner);
     vk_barrier(&eng->vk);
     
@@ -788,7 +800,7 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
     /* 6. dt projection: dt_raw [dt_rank] @ ssm_dt_w [dt_rank, d_inner] + ssm_dt_b → dt [d_inner] */
     /* We need a temp buffer for dt_raw. Reuse mamba_x (first dt_rank elements) as input.
      * mamba_x already has dt_raw at the start. */
-    vk_matmul(&eng->vk, &eng->scratch.mamba_x, &lw->ssm_dt_w,
+    vk_matmul_auto(&eng->vk, &eng->scratch.mamba_x, &lw->ssm_dt_w,
               &eng->scratch.mamba_dt, 1, d_inner, dt_rank);
     vk_barrier(&eng->vk);
     
@@ -827,7 +839,7 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 10. ssm_out projection: [d_inner] → [hidden_size] */
-    vk_matmul(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
+    vk_matmul_auto(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
               &eng->scratch.norm_out, 1, H, d_inner);
     vk_barrier(&eng->vk);
     
@@ -844,9 +856,9 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
                    &eng->scratch.norm_out, H, eng->arch.rms_norm_eps);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
                   &eng->scratch.ffn_gate_out, 1, I, H);
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
                   &eng->scratch.ffn_up_out, 1, I, H);
         vk_barrier(&eng->vk);
         
@@ -857,7 +869,7 @@ static void forward_layer_mamba1(engine* eng, uint32_t layer, uint32_t pos) {
                 &eng->scratch.ffn_gate_out, I);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
+        vk_matmul_auto(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
                   &eng->scratch.ffn_down_out, 1, H, I);
         vk_barrier(&eng->vk);
         
@@ -896,7 +908,7 @@ static void forward_layer_mamba2(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 2. ssm_in projection: hidden → [d_in_proj] */
-    vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ssm_in,
+    vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ssm_in,
               &eng->scratch.mamba_in, 1, d_in_proj, H);
     vk_barrier(&eng->vk);
     
@@ -1000,7 +1012,7 @@ static void forward_layer_mamba2(engine* eng, uint32_t layer, uint32_t pos) {
     vk_barrier(&eng->vk);
     
     /* 10. ssm_out projection: [d_inner] → [hidden_size] */
-    vk_matmul(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
+    vk_matmul_auto(&eng->vk, &eng->scratch.delta_out, &lw->ssm_out,
               &eng->scratch.norm_out, 1, H, d_inner);
     vk_barrier(&eng->vk);
     
@@ -1017,9 +1029,9 @@ static void forward_layer_mamba2(engine* eng, uint32_t layer, uint32_t pos) {
                    &eng->scratch.norm_out, H, eng->arch.rms_norm_eps);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_gate,
                   &eng->scratch.ffn_gate_out, 1, I, H);
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &lw->ffn_up,
                   &eng->scratch.ffn_up_out, 1, I, H);
         vk_barrier(&eng->vk);
         
@@ -1030,7 +1042,7 @@ static void forward_layer_mamba2(engine* eng, uint32_t layer, uint32_t pos) {
                 &eng->scratch.ffn_gate_out, I);
         vk_barrier(&eng->vk);
         
-        vk_matmul(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
+        vk_matmul_auto(&eng->vk, &eng->scratch.ffn_gate_out, &lw->ffn_down,
                   &eng->scratch.ffn_down_out, 1, H, I);
         vk_barrier(&eng->vk);
         
@@ -1056,10 +1068,10 @@ bool engine_forward(engine* eng, const uint32_t* tokens, uint32_t n_tokens) {
     uint32_t pos = eng->cache.seq_len;
     
     for (uint32_t t = 0; t < n_tokens; t++) {
-        /* Embed token */
+        /* Embed token (handles quantized embeddings) */
         vk_begin_compute(&eng->vk);
-        vk_embedding(&eng->vk, &eng->weights.token_embd, &eng->scratch.hidden,
-                     tokens[t], eng->arch.hidden_size);
+        vk_embedding_auto(&eng->vk, &eng->weights.token_embd, &eng->scratch.hidden,
+                          tokens[t], eng->arch.hidden_size);
         vk_barrier(&eng->vk);
         
         /* Run through all layers (dispatch based on type) */
@@ -1072,9 +1084,9 @@ bool engine_forward(engine* eng, const uint32_t* tokens, uint32_t n_tokens) {
                    &eng->scratch.norm_out, eng->arch.hidden_size, eng->arch.rms_norm_eps);
         vk_barrier(&eng->vk);
         
-        /* LM head: logits = norm_out @ output_weight^T */
-        vk_matmul(&eng->vk, &eng->scratch.norm_out, &eng->weights.output,
-                  &eng->scratch.logits, 1, eng->vocab_size, eng->arch.hidden_size);
+        /* LM head: logits = norm_out @ output_weight^T (quantization-aware) */
+        vk_matmul_auto(&eng->vk, &eng->scratch.norm_out, &eng->weights.output,
+                       &eng->scratch.logits, 1, eng->vocab_size, eng->arch.hidden_size);
         
         vk_submit_and_wait(&eng->vk);
     }

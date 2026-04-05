@@ -35,6 +35,9 @@ typedef struct {
     VkDeviceMemory memory;
     size_t         size;
     void*          mapped;  /* persistently mapped pointer (if host-visible) */
+    uint32_t       dtype;   /* ggml_type — quantization format of stored data */
+    uint32_t       n_rows;  /* number of rows (for weight matrices: out_features) */
+    uint32_t       n_cols;  /* number of cols (for weight matrices: in_features) */
 } gpu_buffer;
 
 /* ───── Compute Shader ───── */
@@ -144,7 +147,7 @@ bool vk_submit_and_wait(vk_context* ctx);
 
 /* ─── High-Level Operations ─── */
 
-/* C = A @ B (matrix multiply, fp32 or dequantized) */
+/* C = A @ B (matrix multiply, fp32) */
 void vk_matmul(vk_context* ctx, 
                const gpu_buffer* A, const gpu_buffer* B, gpu_buffer* C,
                uint32_t M, uint32_t N, uint32_t K);
@@ -153,6 +156,43 @@ void vk_matmul(vk_context* ctx,
 void vk_matmul_q4k(vk_context* ctx,
                     const gpu_buffer* A_quant, const gpu_buffer* B, gpu_buffer* C,
                     uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized matmul: C = dequant(A_q3k) @ B */
+void vk_matmul_q3k(vk_context* ctx,
+                    const gpu_buffer* A_quant, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized matmul: C = dequant(A_q6k) @ B */
+void vk_matmul_q6k(vk_context* ctx,
+                    const gpu_buffer* A_quant, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized matmul: C = dequant(A_q5k) @ B */
+void vk_matmul_q5k(vk_context* ctx,
+                    const gpu_buffer* A_quant, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized matmul: C = dequant(A_q8_0) @ B */
+void vk_matmul_q8_0(vk_context* ctx,
+                     const gpu_buffer* A_quant, const gpu_buffer* B, gpu_buffer* C,
+                     uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized matmul: C = dequant(A_f16) @ B */
+void vk_matmul_f16(vk_context* ctx,
+                    const gpu_buffer* A_f16, const gpu_buffer* B, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K);
+
+/* Auto-dispatch matmul: reads W->dtype and calls the right variant.
+ * C = input @ W^T  where input is fp32, W is quantized weight.
+ * M=batch, N=out_features, K=in_features */
+void vk_matmul_auto(vk_context* ctx,
+                    const gpu_buffer* input, const gpu_buffer* W, gpu_buffer* C,
+                    uint32_t M, uint32_t N, uint32_t K);
+
+/* Quantized embedding lookup: dequantizes one row from quantized table */
+void vk_embedding_auto(vk_context* ctx,
+                       const gpu_buffer* table, gpu_buffer* out,
+                       uint32_t token_id, uint32_t dim);
 
 /* RMS normalization: out = x * rsqrt(mean(x^2) + eps) * weight */
 void vk_rmsnorm(vk_context* ctx,
