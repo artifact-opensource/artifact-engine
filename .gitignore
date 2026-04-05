@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.appx
+*.appxbundle
+
+# SPIR-V compiled shaders
+shaders/*.spv
+
+# Models (large binary files)
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# IDE
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Visual Studio
+*.vcxproj*
+*.sln
+Debug/
+Release/
+x64/
+.vs/

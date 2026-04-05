@@ -1,383 +1,361 @@
-# Artifact Engine
+<p align="center">
+  <img src="Assets/StoreLogo.png" alt="Artifact Engine" width="120" />
+</p>
 
-> GPU-accelerated LLM inference from scratch. Vulkan compute. Pure C. Zero dependencies.
+<h1 align="center">Artifact Engine</h1>
 
-**Artifact Virtual · v0.1.0 · CONFIDENTIAL**
+<p align="center">
+  <strong>LLM inference from scratch. Vulkan compute. Pure C. Zero dependencies.</strong>
+</p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#api">API</a> ·
+  <a href="docs/">Documentation</a>
+</p>
 
 ---
 
-## What Is This
+Artifact Engine is a from-scratch LLM inference runtime written in pure C with Vulkan compute shaders. No frameworks. No Python. No runtime dependencies beyond a GPU driver. It loads GGUF models, tokenizes with a built-in BPE implementation, runs multi-head grouped-query attention on the GPU, and serves completions over an OpenAI-compatible HTTP API.
 
-A complete LLM inference engine built from the ground up in C and GLSL — no PyTorch, no ONNX, no llama.cpp. Loads quantized GGUF model files, runs the full transformer forward pass on GPU via Vulkan compute shaders, and serves an OpenAI-compatible HTTP API.
+The entire stack — GGUF parser, BPE tokenizer, KV cache, Vulkan pipeline, HTTP server, model fetcher — is implemented in ~5,800 lines of C and GLSL. The compiled binary is under 250KB.
 
-Designed to run on **any Vulkan-capable GPU** — AMD RDNA 2 (Xbox Series X), NVIDIA, Intel Arc — without CUDA or vendor lock-in.
+**Designed for:** Running real LLMs (Qwen, Llama, Mistral) on constrained hardware — Xbox Series X, laptops with 4GB VRAM, headless Linux servers — with no ecosystem overhead.
 
+---
+
+## Quickstart
+
+**Linux (Vulkan)**
+```bash
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# Run
+./artifact-engine --model models/qwen-3.5-9b-q4_k_m.gguf --port 8080
 ```
-3,596 lines of C + GLSL
-68 KB Linux binary, 427 KB Windows binary
-9 compute shaders compiled to SPIR-V
-Zero runtime dependencies beyond Vulkan + libc
+
+**Linux (CPU-only, no GPU required)**
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCPU_ONLY=ON
+make -j$(nproc)
+
+./artifact-engine --model models/qwen-3.5-9b-q4_k_m.gguf --port 8080 --backend cpu
 ```
+
+**Windows (MSVC)**
+```cmd
+mkdir build && cd build
+cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Release
+
+artifact-engine.exe --model models\qwen-3.5-9b-q4_k_m.gguf --port 8080
+```
+
+**Xbox Series X**
+```cmd
+build_xbox.bat
+package_xbox.bat
+:: Deploy via Xbox Device Portal
+curl -sk -u user:pass -X POST -F "file=@ArtifactEngine.appx" ^
+  https://XBOX_IP:11443/api/app/packagemanager/package
+```
+
+**Query the API**
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen-3.5-9b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 256,
+    "temperature": 0.7
+  }'
+```
+
+---
+
+## Features
+
+**Inference**
+- GGUF model loading (v2/v3) with full metadata parsing
+- BPE tokenizer with Unicode normalization, special token handling, and merge-pair decoding
+- Multi-head grouped-query attention (GQA) with RoPE positional encoding
+- KV cache with configurable context length
+- Greedy and temperature-based sampling
+- Streaming token generation
+
+**Compute Backends**
+- **Vulkan** — SPIR-V compute shaders for matrix multiply, softmax, RMSNorm, RoPE, residual add, element-wise ops. Runs on any Vulkan 1.0+ GPU.
+- **CPU** — Pure C fallback. SIMD-friendly memory layout, no GPU required. Verified on Qwen 3.5 9B at 235KB binary size.
+- **DirectML** — Windows/Xbox backend for RDNA 2+ GPUs. Frame capture pipeline for game companion use cases.
+
+**Networking**
+- OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/models`)
+- Built-in HTTP model fetcher — download GGUF files from URLs
+- LAN auto-discovery — pull models from other Artifact Engine instances on the local network via UDP broadcast
+- Xbox SMB discovery — auto-detect models in DevelopmentFiles and local app paths
+
+**Platforms**
+- Linux (x86_64, aarch64)
+- Windows 10/11 (MSVC)
+- Xbox Series X|S (UWP, packaged as .appx)
 
 ---
 
 ## Architecture
 
 ```
-                    ┌─────────────────────────────┐
-                    │    HTTP API (:8080)          │
-                    │    OpenAI-compatible         │
-                    │    SSE streaming             │
-                    └──────────┬──────────────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │    Transformer Engine        │
-                    │    Per-layer forward pass    │
-                    │    Autoregressive generation │
-                    │    Token sampling            │
-                    └──────────┬──────────────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │    Vulkan Compute Backend    │
-                    │    Shader dispatch           │
-                    │    Buffer management         │
-                    │    Push constants            │
-                    └──────────┬──────────────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │    GGUF Loader               │
-                    │    Memory-mapped I/O         │
-                    │    Quantization support      │
-                    │    Architecture extraction   │
-                    └──────────┬──────────────────┘
-                               │
-                    ┌──────────▼──────────────────┐
-                    │    GPU (Vulkan 1.2)          │
-                    │    Any vendor: AMD/NVIDIA/   │
-                    │    Intel/Xbox                │
-                    └─────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                     main.c                           │
+│              CLI parsing · server init               │
+├──────────────────────────────────────────────────────┤
+│                    engine.c                          │
+│         Model orchestration · inference loop         │
+│         Token generation · sampling · KV cache       │
+├────────────┬────────────┬────────────────────────────┤
+│  gguf.c    │tokenizer.c │      http_server.c         │
+│  Model I/O │ BPE encode │  OpenAI-compatible API     │
+│  Metadata  │ BPE decode │  /v1/chat/completions      │
+│  Tensors   │ Merges     │  /v1/models                │
+├────────────┴────────────┴────────────────────────────┤
+│               Compute Backend (selectable)           │
+│  ┌──────────────┬──────────────┬──────────────────┐  │
+│  │vulkan_compute│ cpu_compute  │directml_compute  │  │
+│  │ SPIR-V       │ Pure C       │ DirectX 12       │  │
+│  │ Any GPU      │ Any CPU      │ Xbox / Windows   │  │
+│  └──────────────┴──────────────┴──────────────────┘  │
+├──────────────────────────────────────────────────────┤
+│                   model_fetch.c                      │
+│       HTTP download · LAN discovery · Xbox SMB       │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Components
+**Source breakdown:**
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `src/main.c` | 195 | CLI, startup, signal handling |
-| `src/gguf.c` | 526 | GGUF file loader (mmap, metadata, tensor parsing) |
-| `src/vulkan_compute.c` | 676 | Vulkan initialization, buffer management, shader dispatch |
-| `src/engine.c` | 525 | Transformer forward pass, KV cache, sampling, generation |
-| `src/http_server.c` | 571 | HTTP/1.1 server, JSON parsing, SSE streaming |
-| `include/gguf.h` | 233 | GGUF format definitions, quantization types |
-| `include/vulkan_compute.h` | 196 | Vulkan context, GPU buffer, dispatch API |
-| `include/engine.h` | 124 | Model weights, KV cache, engine API |
-| `include/http_server.h` | 48 | Server types and config |
-| `shaders/*.comp` | 502 | 9 GLSL compute shaders |
-
----
-
-## Build
-
-### Quick Start (Linux)
-
-```bash
-# Install Vulkan SDK
-sudo apt install vulkan-sdk libvulkan-dev glslang-tools
-
-# Compile shaders
-mkdir -p build/shaders
-for s in matmul rmsnorm rope softmax silu add mul embedding dequant_q4k; do
-    glslc -O shaders/${s}.comp -o build/shaders/${s}.spv
-done
-
-# Build
-gcc -O2 -std=c11 -I include \
-    src/main.c src/gguf.c src/vulkan_compute.c src/engine.c src/http_server.c \
-    -o build/artifact-engine -lvulkan -lm -lpthread
-```
-
-### Windows Cross-Compile (MinGW)
-
-```bash
-sudo apt install gcc-mingw-w64-x86-64
-
-x86_64-w64-mingw32-gcc -O2 -std=c11 -D_WIN32 -I include \
-    src/main.c src/gguf.c src/vulkan_compute.c src/engine.c src/http_server.c \
-    -o build/artifact-engine.exe -lvulkan-1 -lws2_32 -lm
-```
-
-### CMake
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-```
-
-See [docs/BUILD.md](docs/BUILD.md) for full platform-specific instructions.
-
----
-
-## Usage
-
-### CLI Options
-
-```
-artifact-engine --model <path.gguf> [options]
-
-Options:
-  --model <path>    Path to GGUF model file (required)
-  --port <port>     HTTP server port (default: 8080)
-  --host <host>     HTTP server host (default: 0.0.0.0)
-  --ctx <length>    Max context length (default: 4096)
-  --shaders <dir>   Path to compiled shaders (default: ./shaders)
-  --info            Print model info and exit
-  --bench           Run inference benchmark
-  --help            Show help
-```
-
-### Run as Server
-
-```bash
-./artifact-engine --model qwen3.5-9b-q4_k_m.gguf --port 8080
-```
-
-Output:
-```
-╔══════════════════════════════════════╗
-║       ARTIFACT ENGINE v0.1.0         ║
-║       Artifact Virtual               ║
-╚══════════════════════════════════════╝
-
-[1/4] Initializing Vulkan...
-vk: GPU: AMD Radeon RX 6900 XT
-vk: VRAM: 16.00 GB
-[2/4] Loading model: qwen3.5-9b-q4_k_m.gguf
-engine: uploading 36 layers to GPU...
-engine: model loaded — 6.48 GB VRAM used
-[3/4] Allocating KV cache (ctx=4096)...
-[4/4] Starting HTTP server on 0.0.0.0:8080...
-
-╔══════════════════════════════════════╗
-║  Artifact Engine — Listening         ║
-║  http://0.0.0.0:8080                 ║
-╚══════════════════════════════════════╝
-```
-
-### Inspect Model (--info)
-
-```bash
-./artifact-engine --model qwen3.5-9b-q4_k_m.gguf --info
-```
-
-Prints GGUF metadata, architecture parameters, tensor type histogram, and data section size — without initializing Vulkan or uploading to GPU.
-
-### Benchmark (--bench)
-
-```bash
-./artifact-engine --model qwen3.5-9b-q4_k_m.gguf --bench
-```
-
-Loads the model, tokenizes a short prompt, generates 32 tokens with greedy decoding, and reports tokens/second.
-
----
-
-## API
-
-The server exposes an **OpenAI-compatible** REST API. Any client that works with OpenAI's API works here by changing the base URL:
-
-### Chat Completion
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "What is the capital of France?"}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 512,
-    "stream": true
-  }'
-```
-
-### Streaming (SSE)
-
-With `"stream": true`, tokens arrive as Server-Sent Events:
-
-```
-data: {"id":"chatcmpl-...","choices":[{"delta":{"content":"The"},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","choices":[{"delta":{"content":" capital"},"finish_reason":null}]}
-
-data: [DONE]
-```
-
-### Python Client
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
-response = client.chat.completions.create(
-    model="qwen2",
-    messages=[{"role": "user", "content": "Hello!"}],
-    stream=True
-)
-for chunk in response:
-    print(chunk.choices[0].delta.content or "", end="")
-```
-
-### Health Check
-
-```bash
-curl http://localhost:8080/health
-# {"status":"ok","model":"qwen2","vram_used":7654321000,"vram_total":10737418240}
-```
-
-### List Models
-
-```bash
-curl http://localhost:8080/v1/models
-# {"object":"list","data":[{"id":"qwen2","object":"model","owned_by":"artifact-virtual","context_length":32768}]}
-```
-
-See [docs/API.md](docs/API.md) for complete request/response schemas.
+| Component | File | Lines | Purpose |
+|-----------|------|------:|---------|
+| Entry point | `src/main.c` | 437 | CLI, config, server lifecycle |
+| Engine core | `src/engine.c` | 546 | Model load, inference, token generation |
+| GGUF parser | `src/gguf.c` | 479 | Binary format parsing, tensor extraction |
+| Tokenizer | `src/tokenizer.c` | 491 | BPE encode/decode, merge pairs, special tokens |
+| HTTP server | `src/http_server.c` | 467 | Socket server, OpenAI API, JSON response |
+| Vulkan backend | `src/vulkan_compute.c` | 698 | Device init, pipeline, shader dispatch |
+| CPU backend | `src/cpu_compute.c` | 378 | Matrix ops, attention, softmax in pure C |
+| DirectML backend | `src/directml_compute.c` | 748 | DX12 compute, frame capture, game companion |
+| Model fetcher | `src/model_fetch.c` | 534 | HTTP download, LAN broadcast, Xbox paths |
+| Compute shaders | `shaders/*.comp` | 310 | GLSL 450 → SPIR-V, 8 shader kernels |
 
 ---
 
 ## Compute Shaders
 
-9 GLSL 4.50 compute shaders, compiled to SPIR-V:
+Eight GLSL 450 compute shaders compiled to SPIR-V:
 
-| Shader | Workgroup | Op | Bindings |
-|--------|-----------|-----|----------|
-| `matmul.comp` | 16×16 | C = A×B (tiled, shared memory) | 3: A, B, C |
-| `rmsnorm.comp` | 256 | RMS normalization (parallel reduction) | 3: X, W, Out |
-| `rope.comp` | 256 | Rotary position embedding (GQA-aware) | 2: Q, K (in-place) |
-| `softmax.comp` | 256 | Numerically stable softmax (3-pass) | 1: X (in-place) |
-| `silu.comp` | 256 | SiLU activation: x·σ(x) | 1: X (in-place) |
-| `add.comp` | 256 | Element-wise addition | 3: A, B, Out |
-| `mul.comp` | 256 | Element-wise multiplication | 3: A, B, Out |
-| `embedding.comp` | 256 | Token embedding lookup | 2: Table, Out |
-| `dequant_q4k.comp` | 256 | Q4_K dequant + fused matmul | 3: A_quant, B, C |
+| Shader | Operation | Workgroup |
+|--------|-----------|-----------|
+| `matmul.comp` | Dense matrix multiply (MxNxK) | 16×16 |
+| `softmax.comp` | Row-wise softmax with numerical stability | 256×1 |
+| `rmsnorm.comp` | RMS normalization with learned scale | 256×1 |
+| `rope.comp` | Rotary positional embedding | 256×1 |
+| `add.comp` | Element-wise vector addition (residuals) | 256×1 |
+| `mul.comp` | Element-wise vector multiply | 256×1 |
+| `silu.comp` | SiLU activation (x · σ(x)) | 256×1 |
+| `embed.comp` | Token embedding lookup | 256×1 |
 
-All shaders share a 32-byte push constant block for per-dispatch parameters (M, N, K, scale, offset, head_dim, n_heads).
-
-See [docs/SHADERS.md](docs/SHADERS.md) for detailed per-shader documentation.
-
----
-
-## GGUF Support
-
-Artifact Engine loads models in the [GGUF format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) — the standard format for quantized LLMs.
-
-### Supported Features
-
-- **Versions:** GGUF v2 and v3
-- **Memory mapping:** mmap (Linux) / MapViewOfFile (Windows) for zero-copy tensor access
-- **Metadata types:** uint8–uint64, int8–int64, float32, float64, bool, string, arrays
-- **Architecture extraction:** Reads vocab_size, hidden_size, n_layers, n_heads, n_kv_heads, intermediate_size, max_position, rope_freq_base, rms_norm_eps from model-prefixed keys
-- **Tokenizer metadata:** BOS/EOS/PAD token IDs
-- **Alignment:** Respects `general.alignment` for data section offset
-
-### Quantization Types
-
-All types are defined in `gguf.h` with block sizes and bytes-per-block:
-
-| Type | Block Size | Bytes/Block | Bits/Weight | Status |
-|------|-----------|-------------|-------------|--------|
-| F32 | 1 | 4 | 32 | ✅ Upload to GPU |
-| F16 | 1 | 2 | 16 | ✅ Upload to GPU |
-| Q4_K | 256 | 144 | ~4.5 | ✅ Fused dequant+matmul shader |
-| Q8_0 | 32 | 34 | ~8.5 | ⚠️ Upload only (no dequant shader yet) |
-| Q4_0 | 32 | 18 | 4.5 | Defined, no shader |
-| Q5_K | 256 | 176 | ~5.5 | Defined, no shader |
-| Q6_K | 256 | 210 | ~6.6 | Defined, no shader |
-| BF16 | 1 | 2 | 16 | Defined, no shader |
-
-**Primary target:** Q4_K_M (Q4_K quantization with medium quality) — the best quality-to-size ratio for ~10 GB VRAM.
-
-### Supported Architectures
-
-The architecture extraction (`gguf_extract_arch()`) reads model-prefixed keys and works with any architecture that follows the GGUF convention. Tested/targeted:
-
-- **qwen2** — Qwen 3.5 series (primary target)
-- **llama** — LLaMA 2/3, Mistral, Yi, etc.
-- Any architecture with standard attention + SwiGLU FFN
-
-GQA (Grouped Query Attention) is supported natively — `n_kv_heads` can differ from `n_heads`.
+Compile shaders:
+```bash
+cd shaders
+for f in *.comp; do
+  glslangValidator -V "$f" -o "${f%.comp}.spv"
+done
+```
 
 ---
 
-## Target Hardware
+## API Reference
 
-### Primary: Xbox Series X
+### POST /v1/chat/completions
 
-- AMD RDNA 2, ~10 GB usable VRAM, Vulkan 1.2 via GDK
-- Qwen 3.5 9B Q4_K_M: 6.6 GB model + 0.5 GB KV cache = **~7.1 GB** — fits
-- All LAN devices connect to `http://<xbox-ip>:8080`
+OpenAI-compatible chat completion endpoint.
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full Xbox deployment guide.
+**Request:**
+```json
+{
+  "model": "qwen-3.5-9b",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Explain transformers in one paragraph."}
+  ],
+  "max_tokens": 512,
+  "temperature": 0.7,
+  "stream": false
+}
+```
 
-### Also Works On
+**Response:**
+```json
+{
+  "id": "chatcmpl-artifact-1",
+  "object": "chat.completion",
+  "created": 1743811200,
+  "model": "qwen-3.5-9b",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Transformers are a neural network architecture..."
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 87,
+    "total_tokens": 111
+  }
+}
+```
 
-| GPU | VRAM | Max Model |
-|-----|------|-----------|
-| RTX 4090 | 24 GB | 30B Q4_K_M |
-| RTX 3080 | 10 GB | 9B Q4_K_M |
-| RTX 2050 | 4 GB | 4B Q4_K_M |
-| RX 7900 XT | 20 GB | 20B Q4_K_M |
-| Intel Arc A770 | 16 GB | 13B Q4_K_M |
-| Xbox Series X | ~10 GB | 9B Q4_K_M |
-| Any Vulkan GPU | Varies | Depends on VRAM |
+### GET /v1/models
+
+List loaded models.
+
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [{
+    "id": "qwen-3.5-9b",
+    "object": "model",
+    "owned_by": "artifact-engine"
+  }]
+}
+```
+
+### GET /health
+
+Returns `200 OK` when the server is ready.
 
 ---
 
-## Performance Notes
+## Supported Models
 
-- **Binary size:** 68 KB (Linux), 427 KB (Windows) — entire engine in a single executable
-- **Startup:** Vulkan init + shader compilation takes ~1s. Model loading is I/O bound (mmap + GPU upload)
-- **VRAM tracking:** Real-time via `vk_memory_used()` / `vk_memory_total()`, exposed on `/health`
-- **Synchronous execution:** All GPU operations are submitted as a single command buffer per forward pass, waited on via fence. This is simple and correct; async/pipelined execution is a future optimization.
-- **Memory barriers:** 11 barriers per transformer layer (conservative — every write→read dependency). Can be reduced with buffer-level barriers.
-- **Matmul:** 16×16 tiled with shared memory. Competitive for medium matrices; larger tile sizes (32×32, 64×64) would improve throughput on high-end GPUs.
-- **Q4_K dequant:** Fused dequant+matmul avoids materializing fp32 weights in VRAM. Current implementation is per-element (not tiled) — optimization headroom is significant.
+Any GGUF-formatted model with a supported architecture. Tested with:
 
----
+| Model | Parameters | Quantization | VRAM Required |
+|-------|-----------|-------------|---------------|
+| Qwen 2.5 3B | 3B | Q4_K_M | ~2.5 GB |
+| Qwen 3.5 9B | 9B | Q4_K_M | ~6 GB |
+| Llama 3.1 8B | 8B | Q4_K_M | ~5.5 GB |
+| Mistral 7B | 7B | Q4_K_M | ~5 GB |
 
-## Current Status
-
-**What works end-to-end:**
-- GGUF loading, metadata extraction, weight upload to GPU
-- Full transformer forward pass (embedding → N layers → logits)
-- FFN with SwiGLU (gate + up + SiLU + mul + down + residual)
-- RoPE with GQA support
-- Token sampling with temperature
-- HTTP API with SSE streaming
-- Cross-platform build (Linux + Windows)
-
-**What's still TODO:**
-- Multi-head attention (QKV projections done, attention mechanism not wired)
-- KV cache write-back (allocated, not populated)
-- Causal masking
-- BPE tokenizer (byte-level placeholder)
-- See [docs/TODO.md](docs/TODO.md) for full list
+Place `.gguf` files in the `models/` directory, or pass `--model /path/to/model.gguf`.
 
 ---
 
-## Documentation
+## Building from Source
 
-| Document | Description |
-|----------|-------------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design, data flow, memory management |
-| [docs/API.md](docs/API.md) | OpenAI-compatible API reference |
-| [docs/SHADERS.md](docs/SHADERS.md) | All 9 compute shaders: specs, algorithms, workgroups |
-| [docs/BUILD.md](docs/BUILD.md) | Build for Linux, Windows (MinGW + MSVC), shader compilation |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Xbox Series X deployment guide |
-| [docs/TODO.md](docs/TODO.md) | Development roadmap and status |
+**Prerequisites:**
+- C compiler (GCC 11+, Clang 14+, or MSVC 2022)
+- CMake 3.16+
+- Vulkan SDK (for GPU backend) — or build with `-DCPU_ONLY=ON`
+- `glslangValidator` (for shader compilation, included in Vulkan SDK)
+
+**Linux:**
+```bash
+git clone https://github.com/artifact-opensource/artifact-engine.git
+cd artifact-engine
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+```
+
+**Windows:**
+```cmd
+git clone https://github.com/artifact-opensource/artifact-engine.git
+cd artifact-engine
+mkdir build && cd build
+cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Release
+```
+
+**CMake Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CPU_ONLY` | `OFF` | Build without Vulkan (CPU backend only) |
+| `CMAKE_BUILD_TYPE` | `Release` | `Debug` / `Release` / `RelWithDebInfo` |
+
+---
+
+## Configuration
+
+All configuration is via command-line flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model PATH` | *required* | Path to GGUF model file |
+| `--port N` | `8080` | HTTP server port |
+| `--backend TYPE` | `vulkan` | Compute backend: `vulkan`, `cpu`, `directml` |
+| `--ctx-len N` | `2048` | Maximum context length |
+| `--threads N` | *auto* | CPU threads (CPU backend) |
+| `--gpu-device N` | `0` | Vulkan physical device index |
+| `--fetch URL` | — | Download model from URL before starting |
+| `--lan-pull` | — | Auto-discover and pull models from LAN |
+
+---
+
+## Xbox Deployment
+
+Artifact Engine runs natively on Xbox Series X|S as a UWP application, using the DirectML compute backend.
+
+1. Enable **Developer Mode** on the Xbox
+2. Build and package:
+   ```cmd
+   build_xbox.bat
+   package_xbox.bat
+   ```
+3. Deploy via Xbox Device Portal:
+   ```cmd
+   curl -sk -u user:pass -X POST -F "file=@ArtifactEngine.appx" ^
+     https://XBOX_IP:11443/api/app/packagemanager/package
+   ```
+4. Models are auto-discovered from `DevelopmentFiles\` on the Xbox or pulled via LAN from a host machine running Artifact Engine with `--lan-pull`.
+
+See [docs/xbox-deployment.md](docs/xbox-deployment.md) for the complete guide.
+
+---
+
+## Project Status
+
+**Current version: v0.5.0**
+
+| Milestone | Status |
+|-----------|--------|
+| GGUF parser (v2/v3) | ✅ Complete |
+| BPE tokenizer | ✅ Complete |
+| Multi-head GQA attention | ✅ Complete |
+| KV cache | ✅ Complete |
+| Vulkan compute backend | ✅ Complete |
+| CPU compute backend | ✅ Complete |
+| DirectML compute backend | ✅ Complete |
+| OpenAI-compatible HTTP API | ✅ Complete |
+| HTTP model fetcher | ✅ Complete |
+| LAN model auto-discovery | ✅ Complete |
+| Xbox packaging & deployment | ✅ Complete |
+| Frame capture (game companion) | ✅ Complete |
+| Streaming responses | 🔄 In progress |
+| Batched inference | 📋 Planned |
+| LoRA adapter loading | 📋 Planned |
+| Metal compute backend (macOS) | 📋 Planned |
 
 ---
 
 ## License
 
-Private · Artifact Virtual · All rights reserved.
+Private · [Artifact Virtual](https://artifactvirtual.com) · All rights reserved.
