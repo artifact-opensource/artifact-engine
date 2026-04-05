@@ -18,7 +18,7 @@
 
 ---
 
-Artifact Engine is a from-scratch LLM inference runtime written in pure C with Vulkan compute shaders. No frameworks. No Python. No runtime dependencies beyond a GPU driver. It loads GGUF models, tokenizes with a built-in BPE implementation, runs multi-head grouped-query attention on the GPU, and serves completions over an OpenAI-compatible HTTP API.
+Artifact Engine is a Model inference runtime written in pure C with Vulkan compute shaders. No frameworks. No Python. No runtime dependencies beyond a GPU driver. It loads GGUF models, tokenizes with a built-in BPE implementation, runs multi-head grouped-query attention on the GPU, and serves completions over an OpenAI-compatible HTTP API.
 
 The entire stack — GGUF parser, BPE tokenizer, KV cache, Vulkan pipeline, HTTP server, model fetcher — is implemented in ~5,800 lines of C and GLSL. The compiled binary is under 250KB.
 
