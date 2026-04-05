@@ -4,15 +4,19 @@
  * Usage: artifact-engine --model <path.gguf> [--port 8080] [--ctx 4096]
  *
  * Modes:
- *   --info     Just print model info and exit
- *   --server   Run HTTP API server (default)
- *   --bench    Run a simple benchmark
+ *   --info        Just print model info and exit
+ *   --server      Run HTTP API server (default)
+ *   --bench       Run a simple benchmark
+ *   --companion   Run as game companion (frame capture + AI)
+ *   --capture     Frame capture test mode (capture + display stats)
  */
 
 #include "../include/gguf.h"
 #include "../include/engine.h"
 #include "../include/http_server.h"
 #include "../include/model_fetch.h"
+#include "../include/companion.h"
+#include "../include/frame_capture.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +27,7 @@
   #include <windows.h>
 #endif
 
-#define VERSION "0.4.0"
+#define VERSION "0.5.0"
 
 static volatile int running = 1;
 
@@ -34,7 +38,9 @@ static void signal_handler(int sig) {
 }
 
 static void print_usage(const char* argv0) {
-#ifdef CPU_ONLY
+#ifdef DIRECTML_BACKEND
+    printf("Artifact Engine v%s — DirectML LLM Inference (Xbox/Windows)\n", VERSION);
+#elif defined(CPU_ONLY)
     printf("Artifact Engine v%s — CPU LLM Inference\n", VERSION);
 #else
     printf("Artifact Engine v%s — GPU LLM Inference via Vulkan\n", VERSION);
@@ -42,18 +48,24 @@ static void print_usage(const char* argv0) {
     printf("Artifact Virtual — artifact.cloud\n\n");
     printf("Usage: %s --model <path.gguf> [options]\n\n", argv0);
     printf("Options:\n");
-    printf("  --model <path>    Path to GGUF model file (required)\n");
-    printf("  --port <port>     HTTP server port (default: 8080)\n");
-    printf("  --host <host>     HTTP server host (default: 0.0.0.0)\n");
-    printf("  --ctx <length>    Max context length (default: 4096)\n");
-    printf("  --shaders <dir>   Path to compiled shader directory (default: ./shaders)\n");
-    printf("  --pull <url>      Download model from HTTP URL before starting\n");
-    printf("  --info            Print model info and exit\n");
-    printf("  --bench           Run inference benchmark\n");
-    printf("  --help            Show this help\n");
+    printf("  --model <path>      Path to GGUF model file (required for inference)\n");
+    printf("  --port <port>       HTTP server port (default: 8080)\n");
+    printf("  --host <host>       HTTP server host (default: 0.0.0.0)\n");
+    printf("  --ctx <length>      Max context length (default: 4096)\n");
+    printf("  --shaders <dir>     Path to compiled shader directory (default: ./shaders)\n");
+    printf("  --pull <url>        Download model from HTTP URL before starting\n");
+    printf("  --info              Print model info and exit\n");
+    printf("  --bench             Run inference benchmark\n");
+    printf("  --companion         Run as game companion (vision + AI agent)\n");
+    printf("  --capture           Frame capture test mode (no model needed)\n");
+    printf("  --profile <path>    Player profile path (companion mode)\n");
+    printf("  --vision-fps <n>    Vision capture FPS (companion mode, default: 2)\n");
+    printf("  --chattiness <0-1>  Companion chattiness (default: 0.5)\n");
+    printf("  --help              Show this help\n");
     printf("\nExamples:\n");
     printf("  %s --model qwen3.5-9b-q4_k_m.gguf\n", argv0);
-    printf("  %s --model qwen3.5-9b-q4_k_m.gguf --port 8080 --ctx 8192\n", argv0);
+    printf("  %s --model qwen3.5-9b-q4_k_m.gguf --companion --profile player.json\n", argv0);
+    printf("  %s --capture --vision-fps 5\n", argv0);
     printf("\nAPI Endpoints:\n");
     printf("  POST /v1/chat/completions    OpenAI-compatible chat\n");
     printf("  GET  /v1/models              List loaded model\n");
@@ -131,15 +143,194 @@ static DWORD WINAPI engine_thread(LPVOID param) {
 }
 #endif
 
+/* ═══════════════════════════════════════════════════════════
+ * Frame Capture Test Mode
+ * ═══════════════════════════════════════════════════════════ */
+
+static int run_capture_test(uint32_t fps) {
+    printf("\n");
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║    FRAME CAPTURE TEST MODE           ║\n");
+    printf("║    Artifact Engine v%s            ║\n", VERSION);
+    printf("╚══════════════════════════════════════╝\n\n");
+
+    frame_capture* fc = frame_capture_init(fps, false);
+    if (!fc) {
+        fprintf(stderr, "Failed to initialize frame capture\n");
+        return 1;
+    }
+
+    printf("Capturing at %u FPS. Press Ctrl+C to stop.\n\n", fps);
+
+    while (running) {
+        captured_frame frame;
+        if (frame_capture_next(fc, &frame)) {
+            printf("\rFrame %llu: %ux%u, stride=%u, on_gpu=%d",
+                   (unsigned long long)frame.frame_number,
+                   frame.width, frame.height, frame.stride, frame.on_gpu);
+            fflush(stdout);
+
+            /* Free pixel data */
+            if (frame.pixels && !frame.on_gpu) {
+                free(frame.pixels);
+            }
+        }
+
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+
+    printf("\n\n");
+    frame_capture_stats stats;
+    frame_capture_get_stats(fc, &stats);
+    printf("Stats: captured=%llu, dropped=%llu, avg=%.2fms, fps=%.1f\n",
+           (unsigned long long)stats.frames_captured,
+           (unsigned long long)stats.frames_dropped,
+           stats.avg_capture_ms,
+           stats.avg_fps);
+
+    frame_capture_destroy(fc);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * Companion Mode
+ * ═══════════════════════════════════════════════════════════ */
+
+static int run_companion(const char* model_path, const char* profile_path,
+                         uint32_t vision_fps, float chattiness,
+                         const char* host, uint16_t port,
+                         const char* shader_dir, uint32_t ctx_len) {
+    printf("\n");
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║    GAME COMPANION MODE               ║\n");
+    printf("║    Artifact Engine v%s            ║\n", VERSION);
+    printf("╚══════════════════════════════════════╝\n\n");
+
+    /* Configure companion */
+    companion_config cfg = {0};
+    if (model_path) strncpy(cfg.model_path, model_path, sizeof(cfg.model_path) - 1);
+    if (profile_path) strncpy(cfg.profile_path, profile_path, sizeof(cfg.profile_path) - 1);
+    cfg.ctx_length = ctx_len;
+    cfg.chattiness = chattiness;
+    cfg.capture_fps = vision_fps;
+    cfg.vision_interval_ms = vision_fps > 0 ? (1000 / vision_fps) : 500;
+    cfg.auto_save = true;
+    cfg.save_interval_sec = 60;
+    cfg.max_vram_bytes = 2ULL * 1024 * 1024 * 1024;  /* 2 GB companion budget */
+
+    /* Create companion */
+    companion* comp = companion_create(&cfg);
+    if (!comp) {
+        fprintf(stderr, "Failed to create companion\n");
+        return 1;
+    }
+
+    /* Optionally start HTTP server alongside companion for remote control */
+    engine eng = {0};
+    bool server_running = false;
+
+    if (model_path) {
+        printf("[1/3] Initializing compute backend...\n");
+        if (engine_init(&eng, shader_dir)) {
+            printf("[2/3] Loading model: %s\n", model_path);
+            if (engine_load_model(&eng, model_path)) {
+                printf("[3/3] Starting HTTP server on %s:%u...\n", host, port);
+
+                server_config scfg = {
+                    .port = port,
+                    .host = (char*)host,
+                    .model_path = (char*)model_path,
+                    .shader_dir = (char*)shader_dir,
+                    .max_context = ctx_len,
+                    .n_threads = 4,
+                };
+
+                /* Note: server_start blocks. For async, we'd need a thread.
+                 * For v0.5.0: companion loop takes priority, HTTP is optional. */
+                server_running = false;  /* Don't block on server */
+            }
+        }
+    }
+
+    printf("\nCompanion active. Press Ctrl+C to stop.\n");
+    printf("Vision: %u FPS | Chattiness: %.1f | Profile: %s\n\n",
+           vision_fps, chattiness,
+           profile_path ? profile_path : "none");
+
+    /* Main companion loop */
+    uint64_t tick = 0;
+    while (running) {
+        companion_action action = companion_tick(comp, tick);
+
+        if (action.type != COMPANION_ACTION_NONE) {
+            const char* type_names[] = {
+                "NONE", "SPEAK", "TEXT", "HINT", "WARN",
+                "CELEBRATE", "COMFORT", "SUGGEST"
+            };
+            const char* tname = action.type < 8 ? type_names[action.type] : "?";
+
+            printf("[COMPANION %s] (conf=%.2f, urg=%.2f) %s\n",
+                   tname, action.confidence, action.urgency, action.content);
+        }
+
+        /* Print stats periodically */
+        if (tick % 100 == 0 && tick > 0) {
+            companion_stats stats;
+            companion_get_stats(comp, &stats);
+            printf("[STATS] actions=%llu, capture=%.1fms\n",
+                   (unsigned long long)stats.total_actions_taken,
+                   stats.avg_capture_ms);
+
+            const player_profile* pp = companion_get_profile(comp);
+            if (pp) {
+                printf("[PROFILE] agg=%.2f exp=%.2f caut=%.2f skill=%.2f deaths=%u\n",
+                       pp->aggression, pp->exploration, pp->caution,
+                       pp->skill_estimate, pp->deaths_this_session);
+            }
+        }
+
+        tick++;
+
+#ifdef _WIN32
+        Sleep(100);  /* 10 Hz tick rate */
+#else
+        usleep(100000);
+#endif
+    }
+
+    printf("\nShutting down companion...\n");
+    companion_destroy(comp);
+
+    if (server_running || eng.loaded) {
+        engine_destroy(&eng);
+    }
+
+    printf("Done.\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ * Engine Main
+ * ═══════════════════════════════════════════════════════════ */
+
 int engine_main(int argc, char** argv) {
     const char* model_path = NULL;
     const char* pull_url = NULL;
     const char* shader_dir = "./shaders";
     const char* host = "0.0.0.0";
+    const char* profile_path = NULL;
     uint16_t port = 8080;
     uint32_t ctx_len = 4096;
+    uint32_t vision_fps = 2;
+    float chattiness = 0.5f;
     int mode_info = 0;
     int mode_bench = 0;
+    int mode_companion = 0;
+    int mode_capture = 0;
     
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -155,10 +346,20 @@ int engine_main(int argc, char** argv) {
             shader_dir = argv[++i];
         } else if (strcmp(argv[i], "--pull") == 0 && i + 1 < argc) {
             pull_url = argv[++i];
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            profile_path = argv[++i];
+        } else if (strcmp(argv[i], "--vision-fps") == 0 && i + 1 < argc) {
+            vision_fps = (uint32_t)atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--chattiness") == 0 && i + 1 < argc) {
+            chattiness = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--info") == 0) {
             mode_info = 1;
         } else if (strcmp(argv[i], "--bench") == 0) {
             mode_bench = 1;
+        } else if (strcmp(argv[i], "--companion") == 0) {
+            mode_companion = 1;
+        } else if (strcmp(argv[i], "--capture") == 0) {
+            mode_capture = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -169,6 +370,21 @@ int engine_main(int argc, char** argv) {
         }
     }
     
+    /* ─── Capture Test Mode: no model needed ─── */
+    if (mode_capture) {
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        return run_capture_test(vision_fps);
+    }
+
+    /* ─── Companion Mode ─── */
+    if (mode_companion) {
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        return run_companion(model_path, profile_path, vision_fps, chattiness,
+                             host, port, shader_dir, ctx_len);
+    }
+
     /* ─── Pull model from URL if requested ─── */
     if (pull_url && !model_path) {
         const char* fname = model_fetch_filename(pull_url);
@@ -283,7 +499,6 @@ int engine_main(int argc, char** argv) {
 #else
         /* Linux: scan current dir and models/ */
         const char* scan_dirs[] = {".", "models", NULL};
-        /* Simple approach: just check if models/*.gguf exists */
         FILE* fp;
         for (int d = 0; scan_dirs[d] && !model_path; d++) {
             char cmd[256];
@@ -307,7 +522,6 @@ int engine_main(int argc, char** argv) {
 #ifdef _WIN32
             const char* ad = getenv("LOCALAPPDATA");
             if (ad) {
-                /* UWP LocalState — writable by the app */
                 snprintf(fetch_path, sizeof(fetch_path), "%s\\..\\LocalState\\%s", ad, fname);
             } else {
                 snprintf(fetch_path, sizeof(fetch_path), "models\\%s", fname);
@@ -357,7 +571,9 @@ int engine_main(int argc, char** argv) {
     
     engine eng = {0};
     
-#ifdef CPU_ONLY
+#ifdef DIRECTML_BACKEND
+    printf("[1/4] Initializing DirectML...\n");
+#elif defined(CPU_ONLY)
     printf("[1/4] Initializing CPU compute...\n");
 #else
     printf("[1/4] Initializing Vulkan...\n");
@@ -386,7 +602,6 @@ int engine_main(int argc, char** argv) {
     /* ─── Bench Mode ─── */
     if (mode_bench) {
         printf("\n[BENCH] Running benchmark...\n");
-        /* Simple benchmark: encode a short prompt, measure tokens/sec */
         const char* prompt = "The capital of France is";
         uint32_t n_tokens = 0;
         uint32_t* tokens = engine_tokenize(&eng, prompt, &n_tokens);
@@ -394,9 +609,8 @@ int engine_main(int argc, char** argv) {
         if (tokens && n_tokens > 0) {
             printf("[BENCH] Prompt: \"%s\" (%u tokens)\n", prompt, n_tokens);
             
-            /* TODO: timing code */
             sample_params params = {
-                .temperature = 0.0f, /* greedy for benchmark */
+                .temperature = 0.0f,
                 .top_p = 1.0f,
                 .top_k = 1,
                 .max_tokens = 32,
