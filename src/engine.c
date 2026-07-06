@@ -29,10 +29,26 @@
 
 bool engine_init(engine* eng, const char* shader_dir) {
     memset(eng, 0, sizeof(*eng));
+#ifdef CPU_ONLY
+    (void)shader_dir;
+    return true;
+#else
     return vk_init(&eng->vk, shader_dir);
+#endif
 }
 
 /* ───── Upload tensor from GGUF to GPU ───── */
+
+static const gguf_tensor_info* find_tensor_any(const gguf_file* gf,
+                                             const char* a,
+                                             const char* b,
+                                             const char* c) {
+    const gguf_tensor_info* ti = NULL;
+    if (a && (ti = gguf_find_tensor(gf, a))) return ti;
+    if (b && (ti = gguf_find_tensor(gf, b))) return ti;
+    if (c && (ti = gguf_find_tensor(gf, c))) return ti;
+    return NULL;
+}
 
 static bool upload_tensor(engine* eng, gpu_buffer* dst, 
                           const char* name, bool required) {
@@ -197,7 +213,20 @@ bool engine_load_model(engine* eng, const char* model_path) {
             if (gguf_find_tensor(eng->gguf, name)) {
                 UPLOAD_LAYER(post_attn_norm, "post_attention_norm.weight", true);
             } else {
-                UPLOAD_LAYER(ffn_norm, "ffn_norm.weight", true);
+                char alt1[128], alt2[128], primary[128];
+                snprintf(primary, sizeof(primary), "blk.%u.ffn_norm.weight", l);
+                snprintf(alt1, sizeof(alt1), "blk.%u.ffn_norm", l);
+                snprintf(alt2, sizeof(alt2), "blk.%u.post_ffw_norm.weight", l);
+                const gguf_tensor_info* ti_ffn_norm = find_tensor_any(eng->gguf, primary, alt1, alt2);
+                if (!ti_ffn_norm) {
+                    fprintf(stderr, "engine: required tensor '%s' not found (aliases tried: '%s', '%s')\n",
+                            primary, alt1, alt2);
+                    return false;
+                }
+                if (!upload_tensor(eng, &layer->ffn_norm, ti_ffn_norm->name.data, false)) {
+                    fprintf(stderr, "engine: failed to upload tensor '%s'\n", ti_ffn_norm->name.data);
+                    return false;
+                }
             }
             
             UPLOAD_LAYER(ffn_gate, "ffn_gate.weight", true);

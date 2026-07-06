@@ -44,6 +44,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 /* ───── Player Profile ───── */
 typedef struct {

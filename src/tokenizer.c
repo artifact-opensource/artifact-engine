@@ -75,16 +75,25 @@ bool tokenizer_load(tokenizer* tok, const gguf_file* gf) {
     if (!tok->tokens) return false;
 
     /* Extract token strings from array data */
-    /* The array data for string arrays is: [uint64 len, bytes...]* */
-    const uint8_t* ptr = (const uint8_t*)kv_tokens->value.arr.data;
-    for (uint32_t i = 0; i < tok->vocab_size; i++) {
-        uint64_t slen;
-        memcpy(&slen, ptr, 8);
-        ptr += 8;
-        tok->tokens[i] = malloc(slen + 1);
-        memcpy(tok->tokens[i], ptr, slen);
-        tok->tokens[i][slen] = '\0';
-        ptr += slen;
+    if (kv_tokens->value.arr.elem_type == GGUF_TYPE_STRING) {
+        gguf_string* arr = (gguf_string*)kv_tokens->value.arr.data;
+        for (uint32_t i = 0; i < tok->vocab_size; i++) {
+            uint64_t slen = arr[i].len;
+            tok->tokens[i] = malloc(slen + 1);
+            memcpy(tok->tokens[i], arr[i].data, slen);
+            tok->tokens[i][slen] = '\0';
+        }
+    } else {
+        const uint8_t* ptr = (const uint8_t*)kv_tokens->value.arr.data;
+        for (uint32_t i = 0; i < tok->vocab_size; i++) {
+            uint64_t slen;
+            memcpy(&slen, ptr, 8);
+            ptr += 8;
+            tok->tokens[i] = malloc(slen + 1);
+            memcpy(tok->tokens[i], ptr, slen);
+            tok->tokens[i][slen] = '\0';
+            ptr += slen;
+        }
     }
 
     /* Get scores (float array) */
@@ -117,17 +126,18 @@ bool tokenizer_load(tokenizer* tok, const gguf_file* gf) {
         }
 
         /* Parse merges: each is "tokenA tokenB" */
-        const uint8_t* mptr = (const uint8_t*)kv_merges->value.arr.data;
+        if (kv_merges->value.arr.elem_type != GGUF_TYPE_STRING) {
+            fprintf(stderr, "tokenizer: merges array is not string-typed\n");
+            return false;
+        }
+        gguf_string* marr = (gguf_string*)kv_merges->value.arr.data;
         for (uint32_t i = 0; i < tok->n_merges; i++) {
-            uint64_t mlen;
-            memcpy(&mlen, mptr, 8);
-            mptr += 8;
+            uint64_t mlen = marr[i].len;
 
             /* Temporary copy for parsing */
             char* merge_str = malloc(mlen + 1);
-            memcpy(merge_str, mptr, mlen);
+            memcpy(merge_str, marr[i].data, mlen);
             merge_str[mlen] = '\0';
-            mptr += mlen;
 
             /* Split on first space */
             char* space = strchr(merge_str, ' ');

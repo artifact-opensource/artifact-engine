@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(artifact-engine VERSION 0.1.0 LANGUAGES C)
 
+option(CPU_ONLY "Build CPU-only backend" OFF)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -51,9 +53,13 @@ endif()
 set(SOURCES
     src/main.c
     src/gguf.c
-    # src/vulkan_compute.c  # TODO
-    # src/engine.c          # TODO
-    # src/http_server.c     # TODO
+    src/cpu_compute.c
+    src/engine.c
+    src/http_server.c
+    src/model_fetch.c
+    src/frame_capture.c
+    src/companion.c
+    src/tokenizer.c
 )
 
 # Main executable
@@ -63,6 +69,10 @@ target_include_directories(artifact-engine PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${Vulkan_INCLUDE_DIRS}
 )
+
+if(CPU_ONLY)
+    target_compile_definitions(artifact-engine PRIVATE CPU_ONLY)
+endif()
 
 target_link_libraries(artifact-engine PRIVATE
     ${Vulkan_LIBRARIES}

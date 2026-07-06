@@ -325,6 +325,14 @@ void gguf_free(gguf_file* gf) {
             free(gf->kv[i].key.data);
             if (gf->kv[i].type == GGUF_TYPE_STRING) {
                 free(gf->kv[i].value.str.data);
+            } else if (gf->kv[i].type == GGUF_TYPE_ARRAY &&
+                       gf->kv[i].value.arr.elem_type == GGUF_TYPE_STRING &&
+                       gf->kv[i].value.arr.data) {
+                gguf_string* arr = (gguf_string*)gf->kv[i].value.arr.data;
+                for (uint64_t j = 0; j < gf->kv[i].value.arr.count; j++) {
+                    free(arr[j].data);
+                }
+                free(arr);
             }
         }
         free(gf->kv);
