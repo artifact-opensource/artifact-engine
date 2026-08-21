@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+🚀 Artifact Engine CLI
+Beautiful terminal interface for model training and deployment
+"""
+
+import sys
+import os
+
+# Add src to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
+from training import (
+    ArtifactTrainingEngine,
+    TrainingConfig
+)
+
+def main():
+    """Main CLI entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="🚀 Artifact Engine CLI - Build GPT from ground up",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  artifact train https://api.example.com/data
+  artifact build --name my-model --size 7B
+  artifact serve ./artifacts/model.pth --port 8000
+
+For more info: https://artifactvirtual.com/docs
+        """
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # Train command
+    train_parser = subparsers.add_parser("train", help="Train a model")
+    train_parser.add_argument("sources", nargs="+", help="Data sources (URLs, files, APIs)")
+    train_parser.add_argument("--name", default="artifact-gpt", help="Model name")
+    train_parser.add_argument("--size", choices=["1B", "2B", "3B", "6B", "7B", "13B", "30B", "70B"], 
+                             default="7B", help="Model size")
+    train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    train_parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    train_parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
+    train_parser.add_argument("--output", default="./artifacts", help="Output directory")
+    
+    # Build command
+    build_parser = subparsers.add_parser("build", help="Build model architecture")
+    build_parser.add_argument("--name", default="artifact-gpt", help="Model name")
+    build_parser.add_argument("--size", choices=["1B", "2B", "3B", "6B", "7B", "13B", "30B", "70B"], 
+                             default="7B", help="Model size")
+    build_parser.add_argument("--output", default="./artifacts", help="Output directory")
+    
+    # Serve command
+    serve_parser = subparsers.add_parser("serve", help="Serve trained model")
+    serve_parser.add_argument("model_path", help="Path to model checkpoint")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Port number")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Host address")
+    
+    # Data command
+    data_parser = subparsers.add_parser("data", help="Stream data from sources")
+    data_parser.add_argument("sources", nargs="+", help="Data sources")
+    data_parser.add_argument("--output", default="./data", help="Output directory")
+    
+    args = parser.parse_args()
+    
+    if args.command == "train":
+        import asyncio
+        config = TrainingConfig(
+            model_name=args.name,
+            model_size=args.size,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            epochs=args.epochs,
+            output_dir=args.output
+        )
+        engine = ArtifactTrainingEngine(config)
+        asyncio.run(engine.full_pipeline(args.sources))
+    
+    elif args.command == "build":
+        import asyncio
+        config = TrainingConfig(
+            model_name=args.name,
+            model_size=args.size,
+            output_dir=args.output
+        )
+        engine = ArtifactTrainingEngine(config)
+        asyncio.run(engine.build_model())
+    
+    elif args.command == "serve":
+        print(f"🚀 Serving model from {args.model_path}")
+        print(f"🔗 API endpoint: http://{args.host}:{args.port}/v1")
+        print("💡 Press Ctrl+C to stop")
+        # Would start actual server here
+    
+    elif args.command == "data":
+        from training import DataStreamer
+        import asyncio
+        
+        async def stream_data():
+            async with DataStreamer() as streamer:
+                for source in args.sources:
+                    try:
+                        data = await streamer.stream_from_url(source) if source.startswith("http") else await streamer.stream_from_file(source)
+                        print(f"✅ Streamed {source}: {data.size} bytes, quality {data.quality_score:.2%}")
+                    except Exception as e:
+                        print(f"❌ Failed {source}: {e}")
+        
+        asyncio.run(stream_data())
+    
+    else:
+        parser.print_help()
+        print("\n💡 Tip: Use 'artifact --help' for more commands")
+
+if __name__ == "__main__":
+    main()
